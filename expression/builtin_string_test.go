@@ -29,12 +29,10 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/mock"
-	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 )
 
-func (s *testEvaluatorSuite) TestLength(c *C) {
-	defer testleak.AfterTest(c)()
+func (s *testEvaluatorSuite) TestLengthAndOctetLength(c *C) {
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -54,18 +52,21 @@ func (s *testEvaluatorSuite) TestLength(c *C) {
 		{errors.New("must error"), 0, false, true},
 	}
 
-	for _, t := range cases {
-		f, err := newFunctionForTest(s.ctx, ast.Length, s.primitiveValsToConstants([]interface{}{t.args})...)
-		c.Assert(err, IsNil)
-		d, err := f.Eval(chunk.Row{})
-		if t.getErr {
-			c.Assert(err, NotNil)
-		} else {
+	lengthMethods := []string{ast.Length, ast.OctetLength}
+	for _, lengthMethod := range lengthMethods {
+		for _, t := range cases {
+			f, err := newFunctionForTest(s.ctx, lengthMethod, s.primitiveValsToConstants([]interface{}{t.args})...)
 			c.Assert(err, IsNil)
-			if t.isNil {
-				c.Assert(d.Kind(), Equals, types.KindNull)
+			d, err := f.Eval(chunk.Row{})
+			if t.getErr {
+				c.Assert(err, NotNil)
 			} else {
-				c.Assert(d.GetInt64(), Equals, t.expected)
+				c.Assert(err, IsNil)
+				if t.isNil {
+					c.Assert(d.Kind(), Equals, types.KindNull)
+				} else {
+					c.Assert(d.GetInt64(), Equals, t.expected)
+				}
 			}
 		}
 	}
@@ -75,8 +76,6 @@ func (s *testEvaluatorSuite) TestLength(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestASCII(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -113,7 +112,6 @@ func (s *testEvaluatorSuite) TestASCII(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestConcat(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args    []interface{}
 		isNil   bool
@@ -216,7 +214,6 @@ func (s *testEvaluatorSuite) TestConcatSig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestConcatWS(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args     []interface{}
 		isNil    bool
@@ -338,7 +335,6 @@ func (s *testEvaluatorSuite) TestConcatWSSig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestLeft(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -388,7 +384,6 @@ func (s *testEvaluatorSuite) TestLeft(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestRight(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -438,7 +433,6 @@ func (s *testEvaluatorSuite) TestRight(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestRepeat(c *C) {
-	defer testleak.AfterTest(c)()
 	args := []interface{}{"a", int64(2)}
 	fc := funcs[ast.Repeat]
 	f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(args...)))
@@ -536,7 +530,6 @@ func (s *testEvaluatorSuite) TestRepeatSig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestLower(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -569,7 +562,6 @@ func (s *testEvaluatorSuite) TestLower(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestUpper(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -602,7 +594,6 @@ func (s *testEvaluatorSuite) TestUpper(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestReverse(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.Reverse]
 	f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(nil)))
 	c.Assert(err, IsNil)
@@ -633,7 +624,6 @@ func (s *testEvaluatorSuite) TestReverse(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestStrcmp(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -674,8 +664,6 @@ func (s *testEvaluatorSuite) TestStrcmp(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestReplace(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -716,8 +704,6 @@ func (s *testEvaluatorSuite) TestReplace(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestSubstring(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -765,7 +751,6 @@ func (s *testEvaluatorSuite) TestSubstring(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestConvert(c *C) {
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		str           interface{}
 		cs            string
@@ -825,8 +810,6 @@ func (s *testEvaluatorSuite) TestConvert(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestSubstringIndex(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -873,7 +856,6 @@ func (s *testEvaluatorSuite) TestSubstringIndex(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestSpace(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -947,7 +929,6 @@ func (s *testEvaluatorSuite) TestSpaceSig(c *C) {
 
 func (s *testEvaluatorSuite) TestLocate(c *C) {
 	// 1. Test LOCATE without binary input.
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Args []interface{}
 		Want interface{}
@@ -1018,7 +999,6 @@ func (s *testEvaluatorSuite) TestLocate(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestTrim(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -1071,7 +1051,6 @@ func (s *testEvaluatorSuite) TestTrim(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestLTrim(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1113,7 +1092,6 @@ func (s *testEvaluatorSuite) TestLTrim(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestRTrim(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1153,7 +1131,6 @@ func (s *testEvaluatorSuite) TestRTrim(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestHexFunc(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1197,7 +1174,6 @@ func (s *testEvaluatorSuite) TestHexFunc(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestUnhexFunc(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1237,7 +1213,6 @@ func (s *testEvaluatorSuite) TestUnhexFunc(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestBitLength(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -1270,7 +1245,6 @@ func (s *testEvaluatorSuite) TestBitLength(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestChar(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -1320,7 +1294,6 @@ func (s *testEvaluatorSuite) TestChar(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestCharLength(c *C) {
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		input  interface{}
 		result interface{}
@@ -1369,8 +1342,6 @@ func (s *testEvaluatorSuite) TestCharLength(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestFindInSet(c *C) {
-	defer testleak.AfterTest(c)()
-
 	for _, t := range []struct {
 		str    interface{}
 		strlst interface{}
@@ -1398,7 +1369,6 @@ func (s *testEvaluatorSuite) TestFindInSet(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestField(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -1517,7 +1487,7 @@ func (s *testEvaluatorSuite) TestRpadSig(c *C) {
 	}
 
 	base := baseBuiltinFunc{args: args, ctx: s.ctx, tp: resultType}
-	rpad := &builtinRpadSig{base, 1000}
+	rpad := &builtinRpadUTF8Sig{base, 1000}
 
 	input := chunk.NewChunkWithCapacity(colTypes, 10)
 	input.AppendString(0, "abc")
@@ -1560,7 +1530,7 @@ func (s *testEvaluatorSuite) TestInsertBinarySig(c *C) {
 	}
 
 	base := baseBuiltinFunc{args: args, ctx: s.ctx, tp: resultType}
-	insert := &builtinInsertBinarySig{base, 3}
+	insert := &builtinInsertSig{base, 3}
 
 	input := chunk.NewChunkWithCapacity(colTypes, 2)
 	input.AppendString(0, "abc")
@@ -1634,7 +1604,6 @@ func (s *testEvaluatorSuite) TestInsertBinarySig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestInstr(c *C) {
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Args []interface{}
 		Want interface{}
@@ -1679,8 +1648,6 @@ func (s *testEvaluatorSuite) TestInstr(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestMakeSet(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		argList []interface{}
 		ret     interface{}
@@ -1706,7 +1673,6 @@ func (s *testEvaluatorSuite) TestMakeSet(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestOct(c *C) {
-	defer testleak.AfterTest(c)()
 	octTests := []struct {
 		origin interface{}
 		ret    string
@@ -1755,7 +1721,6 @@ func (s *testEvaluatorSuite) TestOct(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestFormat(c *C) {
-	defer testleak.AfterTest(c)()
 	formatTests := []struct {
 		number    interface{}
 		precision interface{}
@@ -1848,7 +1813,7 @@ func (s *testEvaluatorSuite) TestFormat(c *C) {
 			warnings := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
 			c.Assert(len(warnings), Equals, tt.warnings, Commentf("test %v", tt))
 			for i := 0; i < tt.warnings; i++ {
-				c.Assert(terror.ErrorEqual(types.ErrTruncated, warnings[i].Err), IsTrue, Commentf("test %v", tt))
+				c.Assert(terror.ErrorEqual(types.ErrTruncatedWrongVal, warnings[i].Err), IsTrue, Commentf("test %v", tt))
 			}
 			s.ctx.GetSessionVars().StmtCtx.SetWarnings([]stmtctx.SQLWarn{})
 		}
@@ -2023,8 +1988,6 @@ func (s *testEvaluatorSuite) TestInsert(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestOrd(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -2065,8 +2028,6 @@ func (s *testEvaluatorSuite) TestOrd(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestElt(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		argLst []interface{}
 		ret    interface{}
@@ -2089,8 +2050,6 @@ func (s *testEvaluatorSuite) TestElt(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestExportSet(c *C) {
-	defer testleak.AfterTest(c)()
-
 	estd := []struct {
 		argLst []interface{}
 		res    string
@@ -2120,8 +2079,6 @@ func (s *testEvaluatorSuite) TestExportSet(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestBin(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		Input    interface{}
 		Expected interface{}
@@ -2153,8 +2110,6 @@ func (s *testEvaluatorSuite) TestBin(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestQuote(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		arg interface{}
 		ret interface{}
@@ -2168,7 +2123,7 @@ func (s *testEvaluatorSuite) TestQuote(c *C) {
 		{`萌萌哒(๑•ᴗ•๑)😊`, `'萌萌哒(๑•ᴗ•๑)😊'`},
 		{`㍿㌍㍑㌫`, `'㍿㌍㍑㌫'`},
 		{string([]byte{0, 26}), `'\0\Z'`},
-		{nil, nil},
+		{nil, "NULL"},
 	}
 
 	for _, t := range tbl {
@@ -2183,8 +2138,6 @@ func (s *testEvaluatorSuite) TestQuote(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestToBase64(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tests := []struct {
 		args   interface{}
 		expect string
@@ -2322,7 +2275,6 @@ func (s *testEvaluatorSuite) TestToBase64Sig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestStringRight(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.Right]
 	tests := []struct {
 		str    interface{}

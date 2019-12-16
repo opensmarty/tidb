@@ -16,6 +16,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/pingcap/errors"
@@ -49,14 +50,7 @@ type DDLExec struct {
 
 // toErr converts the error to the ErrInfoSchemaChanged when the schema is outdated.
 func (e *DDLExec) toErr(err error) error {
-	if e.ctx.GetSessionVars().StmtCtx.IsDDLJobInQueue {
-		return err
-	}
-
-	// Before the DDL job is ready, it encouters an error that may be due to the outdated schema information.
-	// After the DDL job is ready, the ErrInfoSchemaChanged error won't happen because we are getting the schema directly from storage.
-	// So we needn't to consider this condition.
-	// Here we distinguish the ErrInfoSchemaChanged error from other errors.
+	// The err may be cause by schema changed, here we distinguish the ErrInfoSchemaChanged error from other errors.
 	dom := domain.GetDomain(e.ctx)
 	checker := domain.NewSchemaChecker(dom, e.is.SchemaMetaVersion(), nil)
 	txn, err1 := e.ctx.Txn(true)
@@ -105,6 +99,8 @@ func (e *DDLExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 		err = e.executeDropTableOrView(x)
 	case *ast.RecoverTableStmt:
 		err = e.executeRecoverTable(x)
+	case *ast.FlashBackTableStmt:
+		err = e.executeFlashbackTable(x)
 	case *ast.RenameTableStmt:
 		err = e.executeRenameTable(x)
 	case *ast.TruncateTableStmt:
@@ -115,10 +111,19 @@ func (e *DDLExec) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 		err = e.executeUnlockTables(x)
 	case *ast.CleanupTableLockStmt:
 		err = e.executeCleanupTableLock(x)
+	case *ast.RepairTableStmt:
+		err = e.executeRepairTable(x)
 
 	}
 	if err != nil {
-		return e.toErr(err)
+		// If the owner return ErrTableNotExists error when running this DDL, it may be caused by schema changed,
+		// otherwise, ErrTableNotExists can be returned before putting this DDL job to the job queue.
+		if (e.ctx.GetSessionVars().StmtCtx.IsDDLJobInQueue && infoschema.ErrTableNotExists.Equal(err)) ||
+			!e.ctx.GetSessionVars().StmtCtx.IsDDLJobInQueue {
+			return e.toErr(err)
+		}
+		return err
+
 	}
 
 	dom := domain.GetDomain(e.ctx)
@@ -189,8 +194,8 @@ func (e *DDLExec) executeCreateView(s *ast.CreateViewStmt) error {
 
 func (e *DDLExec) executeCreateIndex(s *ast.CreateIndexStmt) error {
 	ident := ast.Ident{Schema: s.Table.Schema, Name: s.Table.Name}
-	err := domain.GetDomain(e.ctx).DDL().CreateIndex(e.ctx, ident, s.Unique, model.NewCIStr(s.IndexName),
-		s.IndexColNames, s.IndexOption, s.IfNotExists)
+	err := domain.GetDomain(e.ctx).DDL().CreateIndex(e.ctx, ident, s.KeyType, model.NewCIStr(s.IndexName),
+		s.IndexPartSpecifications, s.IndexOption, s.IfNotExists)
 	return err
 }
 
@@ -275,7 +280,7 @@ func (e *DDLExec) executeDropTableOrView(s *ast.DropTableStmt) error {
 				zap.String("table", fullti.Name.O),
 			)
 			sql := fmt.Sprintf("admin check table `%s`.`%s`", fullti.Schema.O, fullti.Name.O)
-			_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
+			_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(sql)
 			if err != nil {
 				return err
 			}
@@ -328,23 +333,32 @@ func (e *DDLExec) executeRecoverTable(s *ast.RecoverTableStmt) error {
 	if s.JobID != 0 {
 		job, tblInfo, err = e.getRecoverTableByJobID(s, t, dom)
 	} else {
-		job, tblInfo, err = e.getRecoverTableByTableName(s, t, dom)
+		job, tblInfo, err = e.getRecoverTableByTableName(s.Table, "")
 	}
 	if err != nil {
 		return err
 	}
+	autoID, err := e.getTableAutoIDFromSnapshot(job)
+	if err != nil {
+		return err
+	}
+	// Call DDL RecoverTable.
+	err = domain.GetDomain(e.ctx).DDL().RecoverTable(e.ctx, tblInfo, job.SchemaID, autoID, job.ID, job.StartTS)
+	return err
+}
+
+func (e *DDLExec) getTableAutoIDFromSnapshot(job *model.Job) (int64, error) {
 	// Get table original autoID before table drop.
+	dom := domain.GetDomain(e.ctx)
 	m, err := dom.GetSnapshotMeta(job.StartTS)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	autoID, err := m.GetAutoTableID(job.SchemaID, job.TableID)
 	if err != nil {
-		return errors.Errorf("recover table_id: %d, get original autoID from snapshot meta err: %s", job.TableID, err.Error())
+		return 0, errors.Errorf("recover table_id: %d, get original autoID from snapshot meta err: %s", job.TableID, err.Error())
 	}
-	// Call DDL RecoverTable
-	err = domain.GetDomain(e.ctx).DDL().RecoverTable(e.ctx, tblInfo, job.SchemaID, autoID, job.ID, job.StartTS)
-	return err
+	return autoID, nil
 }
 
 func (e *DDLExec) getRecoverTableByJobID(s *ast.RecoverTableStmt, t *meta.Meta, dom *domain.Domain) (*model.Job, *model.TableInfo, error) {
@@ -381,7 +395,12 @@ func (e *DDLExec) getRecoverTableByJobID(s *ast.RecoverTableStmt, t *meta.Meta, 
 	return job, table.Meta(), nil
 }
 
-func (e *DDLExec) getRecoverTableByTableName(s *ast.RecoverTableStmt, t *meta.Meta, dom *domain.Domain) (*model.Job, *model.TableInfo, error) {
+func (e *DDLExec) getRecoverTableByTableName(tableName *ast.TableName, ts string) (*model.Job, *model.TableInfo, error) {
+	txn, err := e.ctx.Txn(true)
+	if err != nil {
+		return nil, nil, err
+	}
+	t := meta.NewMeta(txn)
 	jobs, err := t.GetAllHistoryDDLJobs()
 	if err != nil {
 		return nil, nil, err
@@ -392,23 +411,27 @@ func (e *DDLExec) getRecoverTableByTableName(s *ast.RecoverTableStmt, t *meta.Me
 	if err != nil {
 		return nil, nil, err
 	}
-	schemaName := s.Table.Schema.L
+	schemaName := tableName.Schema.L
 	if schemaName == "" {
 		schemaName = e.ctx.GetSessionVars().CurrentDB
 	}
 	if schemaName == "" {
 		return nil, nil, errors.Trace(core.ErrNoDB)
 	}
+	dom := domain.GetDomain(e.ctx)
 	// TODO: only search recent `e.JobNum` DDL jobs.
 	for i := len(jobs) - 1; i > 0; i-- {
 		job = jobs[i]
-		if job.Type != model.ActionDropTable {
+		if job.Type != model.ActionDropTable && job.Type != model.ActionTruncateTable {
 			continue
 		}
 		// Check GC safe point for getting snapshot infoSchema.
 		err = gcutil.ValidateSnapshotWithGCSafePoint(job.StartTS, gcSafePoint)
 		if err != nil {
 			return nil, nil, err
+		}
+		if len(ts) != 0 && ts != model.TSConvert2Time(job.StartTS).String() {
+			continue
 		}
 		// Get the snapshot infoSchema before drop table.
 		snapInfo, err := dom.GetSnapshotInfoSchema(job.StartTS)
@@ -423,7 +446,7 @@ func (e *DDLExec) getRecoverTableByTableName(s *ast.RecoverTableStmt, t *meta.Me
 				fmt.Sprintf("(Table ID %d)", job.TableID),
 			)
 		}
-		if table.Meta().Name.L == s.Table.Name.L {
+		if table.Meta().Name.L == tableName.Name.L {
 			schema, ok := dom.InfoSchema().SchemaByID(job.SchemaID)
 			if !ok {
 				return nil, nil, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(
@@ -437,9 +460,37 @@ func (e *DDLExec) getRecoverTableByTableName(s *ast.RecoverTableStmt, t *meta.Me
 		}
 	}
 	if tblInfo == nil {
-		return nil, nil, errors.Errorf("Can't found drop table: %v in ddl history jobs", s.Table.Name)
+		return nil, nil, errors.Errorf("Can't find dropped table: %v in ddl history jobs", tableName.Name)
 	}
 	return job, tblInfo, nil
+}
+
+func (e *DDLExec) executeFlashbackTable(s *ast.FlashBackTableStmt) error {
+	ts := s.Timestamp.GetString()
+	if len(ts) == 0 {
+		return errors.Errorf("The timestamp in flashback statement should be consistent with the drop/truncate DDL start time")
+	}
+	job, tblInfo, err := e.getRecoverTableByTableName(s.Table, ts)
+	if err != nil {
+		return err
+	}
+	if len(s.NewName) != 0 {
+		tblInfo.Name = model.NewCIStr(s.NewName)
+	}
+	// Check the table ID was not exists.
+	is := domain.GetDomain(e.ctx).InfoSchema()
+	_, ok := is.TableByID(tblInfo.ID)
+	if ok {
+		return infoschema.ErrTableExists.GenWithStackByArgs("tableID:" + strconv.FormatInt(tblInfo.ID, 10))
+	}
+
+	autoID, err := e.getTableAutoIDFromSnapshot(job)
+	if err != nil {
+		return err
+	}
+	// Call DDL RecoverTable.
+	err = domain.GetDomain(e.ctx).DDL().RecoverTable(e.ctx, tblInfo, job.SchemaID, autoID, job.ID, job.StartTS)
+	return err
 }
 
 func (e *DDLExec) executeLockTables(s *ast.LockTablesStmt) error {
@@ -458,6 +509,9 @@ func (e *DDLExec) executeUnlockTables(s *ast.UnlockTablesStmt) error {
 }
 
 func (e *DDLExec) executeCleanupTableLock(s *ast.CleanupTableLockStmt) error {
-	err := domain.GetDomain(e.ctx).DDL().CleanupTableLock(e.ctx, s.Tables)
-	return err
+	return domain.GetDomain(e.ctx).DDL().CleanupTableLock(e.ctx, s.Tables)
+}
+
+func (e *DDLExec) executeRepairTable(s *ast.RepairTableStmt) error {
+	return domain.GetDomain(e.ctx).DDL().RepairTable(e.ctx, s.Table, s.CreateStmt)
 }

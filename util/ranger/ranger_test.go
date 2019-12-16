@@ -14,6 +14,7 @@
 package ranger_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/testutil"
 )
 
 func TestT(t *testing.T) {
@@ -43,10 +45,18 @@ var _ = Suite(&testRangerSuite{})
 
 type testRangerSuite struct {
 	*parser.Parser
+	testData testutil.TestData
 }
 
 func (s *testRangerSuite) SetUpSuite(c *C) {
 	s.Parser = parser.New()
+	var err error
+	s.testData, err = testutil.LoadTestSuiteData("testdata", "ranger_suite")
+	c.Assert(err, IsNil)
+}
+
+func (s *testRangerSuite) TearDownSuite(c *C) {
+	c.Assert(s.testData.GenerateOutputIfNeeded(), IsNil)
 }
 
 func newDomainStoreWithBootstrap(c *C) (*domain.Domain, kv.Storage, error) {
@@ -292,27 +302,28 @@ func (s *testRangerSuite) TestTableRange(c *C) {
 		},
 	}
 
+	ctx := context.Background()
 	for _, tt := range tests {
 		sql := "select * from t where " + tt.exprStr
-		ctx := testKit.Se.(sessionctx.Context)
-		stmts, err := session.Parse(ctx, sql)
+		sctx := testKit.Se.(sessionctx.Context)
+		stmts, err := session.Parse(sctx, sql)
 		c.Assert(err, IsNil, Commentf("error %v, for expr %s", err, tt.exprStr))
 		c.Assert(stmts, HasLen, 1)
-		is := domain.GetDomain(ctx).InfoSchema()
-		err = plannercore.Preprocess(ctx, stmts[0], is)
+		is := domain.GetDomain(sctx).InfoSchema()
+		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
-		conds := make([]expression.Expression, 0, len(selection.Conditions))
-		for _, cond := range selection.Conditions {
-			conds = append(conds, expression.PushDownNot(ctx, cond, false))
+		conds := make([]expression.Expression, len(selection.Conditions))
+		for i, cond := range selection.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
 		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo()
 		col := expression.ColInfo2Col(selection.Schema().Columns, tbl.Columns[0])
 		c.Assert(col, NotNil)
 		var filter []expression.Expression
-		conds, filter = ranger.DetachCondsForColumn(ctx, conds, col)
+		conds, filter = ranger.DetachCondsForColumn(sctx, conds, col)
 		c.Assert(fmt.Sprintf("%s", conds), Equals, tt.accessConds, Commentf("wrong access conditions for expr: %s", tt.exprStr))
 		c.Assert(fmt.Sprintf("%s", filter), Equals, tt.filterConds, Commentf("wrong filter conditions for expr: %s", tt.exprStr))
 		result, err := ranger.BuildTableRange(conds, new(stmtctx.StatementContext), col.RetType)
@@ -422,7 +433,7 @@ func (s *testRangerSuite) TestIndexRange(c *C) {
 		{
 			indexPos:    0,
 			exprStr:     `a in ('a') and b in ('1', 2.0, NULL)`,
-			accessConds: "[in(test.t.a, a) in(test.t.b, 1, 2, <nil>)]",
+			accessConds: "[eq(test.t.a, a) in(test.t.b, 1, 2, <nil>)]",
 			filterConds: "[]",
 			resultStr:   `[["a" 1,"a" 1] ["a" 2,"a" 2]]`,
 		},
@@ -464,7 +475,7 @@ func (s *testRangerSuite) TestIndexRange(c *C) {
 		{
 			indexPos:    0,
 			exprStr:     "a in (NULL)",
-			accessConds: "[in(test.t.a, <nil>)]",
+			accessConds: "[eq(test.t.a, <nil>)]",
 			filterConds: "[]",
 			resultStr:   "[]",
 		},
@@ -485,14 +496,14 @@ func (s *testRangerSuite) TestIndexRange(c *C) {
 		{
 			indexPos:    0,
 			exprStr:     "not (a not in (NULL) and a > '2')",
-			accessConds: "[or(in(test.t.a, <nil>), le(test.t.a, 2))]",
+			accessConds: "[or(eq(test.t.a, <nil>), le(test.t.a, 2))]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,\"2\"]]",
 		},
 		{
 			indexPos:    0,
 			exprStr:     "not (a not in (NULL) or a > '2')",
-			accessConds: "[and(in(test.t.a, <nil>), le(test.t.a, 2))]",
+			accessConds: "[and(eq(test.t.a, <nil>), le(test.t.a, 2))]",
 			filterConds: "[]",
 			resultStr:   "[]",
 		},
@@ -547,17 +558,17 @@ func (s *testRangerSuite) TestIndexRange(c *C) {
 		},
 		{
 			indexPos:    2,
-			exprStr:     `d in ("你好啊")`,
-			accessConds: "[in(test.t.d, 你好啊)]",
-			filterConds: "[in(test.t.d, 你好啊)]",
-			resultStr:   "[[\"你好\",\"你好\"]]",
+			exprStr:     `d in ("你好啊", "再见")`,
+			accessConds: "[in(test.t.d, 你好啊, 再见)]",
+			filterConds: "[in(test.t.d, 你好啊, 再见)]",
+			resultStr:   "[[\"你好\",\"你好\"] [\"再见\",\"再见\"]]",
 		},
 		{
 			indexPos:    2,
 			exprStr:     `d not in ("你好啊")`,
-			accessConds: "[not(in(test.t.d, 你好啊))]",
-			filterConds: "[not(in(test.t.d, 你好啊))]",
-			resultStr:   "[(NULL,+inf]]",
+			accessConds: "[]",
+			filterConds: "[ne(test.t.d, 你好啊)]",
+			resultStr:   "[[NULL,+inf]]",
 		},
 		{
 			indexPos:    2,
@@ -575,27 +586,28 @@ func (s *testRangerSuite) TestIndexRange(c *C) {
 		},
 	}
 
+	ctx := context.Background()
 	for _, tt := range tests {
 		sql := "select * from t where " + tt.exprStr
-		ctx := testKit.Se.(sessionctx.Context)
-		stmts, err := session.Parse(ctx, sql)
+		sctx := testKit.Se.(sessionctx.Context)
+		stmts, err := session.Parse(sctx, sql)
 		c.Assert(err, IsNil, Commentf("error %v, for expr %s", err, tt.exprStr))
 		c.Assert(stmts, HasLen, 1)
-		is := domain.GetDomain(ctx).InfoSchema()
-		err = plannercore.Preprocess(ctx, stmts[0], is)
+		is := domain.GetDomain(sctx).InfoSchema()
+		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
 		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo()
 		c.Assert(selection, NotNil, Commentf("expr:%v", tt.exprStr))
-		conds := make([]expression.Expression, 0, len(selection.Conditions))
-		for _, cond := range selection.Conditions {
-			conds = append(conds, expression.PushDownNot(ctx, cond, false))
+		conds := make([]expression.Expression, len(selection.Conditions))
+		for i, cond := range selection.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
-		cols, lengths := expression.IndexInfo2Cols(selection.Schema().Columns, tbl.Indices[tt.indexPos])
+		cols, lengths := expression.IndexInfo2PrefixCols(tbl.Columns, selection.Schema().Columns, tbl.Indices[tt.indexPos])
 		c.Assert(cols, NotNil)
-		res, err := ranger.DetachCondAndBuildRangeForIndex(ctx, conds, cols, lengths)
+		res, err := ranger.DetachCondAndBuildRangeForIndex(sctx, conds, cols, lengths)
 		c.Assert(err, IsNil)
 		c.Assert(fmt.Sprintf("%s", res.AccessConds), Equals, tt.accessConds, Commentf("wrong access conditions for expr: %s", tt.exprStr))
 		c.Assert(fmt.Sprintf("%s", res.RemainedConds), Equals, tt.filterConds, Commentf("wrong filter conditions for expr: %s", tt.exprStr))
@@ -649,9 +661,9 @@ func (s *testRangerSuite) TestIndexRangeForUnsignedInt(c *C) {
 		{
 			indexPos:    0,
 			exprStr:     `a not in (111)`,
-			accessConds: "[not(in(test.t.a, 111))]",
+			accessConds: "[ne(test.t.a, 111)]",
 			filterConds: "[]",
-			resultStr:   `[(NULL,111) (111,+inf]]`,
+			resultStr:   `[[-inf,111) (111,+inf]]`,
 		},
 		{
 			indexPos:    0,
@@ -695,27 +707,28 @@ func (s *testRangerSuite) TestIndexRangeForUnsignedInt(c *C) {
 		},
 	}
 
+	ctx := context.Background()
 	for _, tt := range tests {
 		sql := "select * from t where " + tt.exprStr
-		ctx := testKit.Se.(sessionctx.Context)
-		stmts, err := session.Parse(ctx, sql)
+		sctx := testKit.Se.(sessionctx.Context)
+		stmts, err := session.Parse(sctx, sql)
 		c.Assert(err, IsNil, Commentf("error %v, for expr %s", err, tt.exprStr))
 		c.Assert(stmts, HasLen, 1)
-		is := domain.GetDomain(ctx).InfoSchema()
-		err = plannercore.Preprocess(ctx, stmts[0], is)
+		is := domain.GetDomain(sctx).InfoSchema()
+		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
 		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo()
 		c.Assert(selection, NotNil, Commentf("expr:%v", tt.exprStr))
-		conds := make([]expression.Expression, 0, len(selection.Conditions))
-		for _, cond := range selection.Conditions {
-			conds = append(conds, expression.PushDownNot(ctx, cond, false))
+		conds := make([]expression.Expression, len(selection.Conditions))
+		for i, cond := range selection.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
-		cols, lengths := expression.IndexInfo2Cols(selection.Schema().Columns, tbl.Indices[tt.indexPos])
+		cols, lengths := expression.IndexInfo2PrefixCols(tbl.Columns, selection.Schema().Columns, tbl.Indices[tt.indexPos])
 		c.Assert(cols, NotNil)
-		res, err := ranger.DetachCondAndBuildRangeForIndex(ctx, conds, cols, lengths)
+		res, err := ranger.DetachCondAndBuildRangeForIndex(sctx, conds, cols, lengths)
 		c.Assert(err, IsNil)
 		c.Assert(fmt.Sprintf("%s", res.AccessConds), Equals, tt.accessConds, Commentf("wrong access conditions for expr: %s", tt.exprStr))
 		c.Assert(fmt.Sprintf("%s", res.RemainedConds), Equals, tt.filterConds, Commentf("wrong filter conditions for expr: %s", tt.exprStr))
@@ -743,6 +756,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 		accessConds string
 		filterConds string
 		resultStr   string
+		length      int
 	}{
 		{
 			colPos:      0,
@@ -750,6 +764,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[eq(test.t.a, 1)]",
 			filterConds: "[gt(test.t.b, 1)]",
 			resultStr:   "[[1,1]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      1,
@@ -757,6 +772,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.b, 1)]",
 			filterConds: "[]",
 			resultStr:   "[(1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -764,6 +780,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[eq(1, test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[1,1]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -771,6 +788,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[ne(test.t.a, 1)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1) (1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -778,6 +796,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[ne(1, test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1) (1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -785,6 +804,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.a, 1)]",
 			filterConds: "[]",
 			resultStr:   "[(1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -792,6 +812,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[lt(1, test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[(1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -799,6 +820,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[ge(test.t.a, 1)]",
 			filterConds: "[]",
 			resultStr:   "[[1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -806,6 +828,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[le(1, test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[1,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -813,6 +836,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[lt(test.t.a, 1)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1)]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -820,6 +844,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(1, test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1)]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -827,6 +852,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[le(test.t.a, 1)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -834,6 +860,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[ge(1, test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -841,6 +868,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[test.t.a]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,0) (0,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -848,6 +876,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[in(test.t.a, 1, 3, <nil>, 2)]",
 			filterConds: "[]",
 			resultStr:   "[[1,1] [2,2] [3,3]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -855,6 +884,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[in(test.t.a, 8, 8, 81, 45)]",
 			filterConds: "[]",
 			resultStr:   `[[8,8] [45,45] [81,81]]`,
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -862,6 +892,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[ge(test.t.a, 1) le(test.t.a, 2)]",
 			filterConds: "[]",
 			resultStr:   "[[1,2]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -869,6 +900,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[or(lt(test.t.a, 1), gt(test.t.a, 2))]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,1) (2,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		//{
 		// `a > null` will be converted to `castAsString(a) > null` which can not be extracted as access condition.
@@ -881,6 +913,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[ge(test.t.a, 2) le(test.t.a, 1)]",
 			filterConds: "[]",
 			resultStr:   "[]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -888,6 +921,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[or(lt(test.t.a, 2), gt(test.t.a, 1))]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -895,6 +929,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[isnull(test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[NULL,NULL]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -902,6 +937,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[not(isnull(test.t.a))]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -909,6 +945,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[istrue(test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[-inf,0) (0,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -916,6 +953,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[not(istrue(test.t.a))]",
 			filterConds: "[]",
 			resultStr:   "[[NULL,NULL] [0,0]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -923,6 +961,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[isfalse(test.t.a)]",
 			filterConds: "[]",
 			resultStr:   "[[0,0]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -930,6 +969,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[not(isfalse(test.t.a))]",
 			filterConds: "[]",
 			resultStr:   "[[NULL,0) (0,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      1,
@@ -937,6 +977,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[in(test.t.b, 1, 2.1)]",
 			filterConds: "[]",
 			resultStr:   "[[1,1] [2.1,2.1]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      0,
@@ -944,6 +985,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.a, 9223372036854775807)]",
 			filterConds: "[]",
 			resultStr:   "[(9223372036854775807,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      2,
@@ -951,6 +993,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.c, 111.11111111)]",
 			filterConds: "[]",
 			resultStr:   "[[111.111115,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      3,
@@ -958,6 +1001,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.d, aaaaaaaaaaaaaa)]",
 			filterConds: "[]",
 			resultStr:   "[(\"aaaaaaaaaaaaaa\",+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      4,
@@ -965,6 +1009,7 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.e, 18446744073709500000)]",
 			filterConds: "[]",
 			resultStr:   "[(18446744073709500000,+inf]]",
+			length:      types.UnspecifiedLength,
 		},
 		{
 			colPos:      4,
@@ -972,32 +1017,51 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 			accessConds: "[gt(test.t.e, -2147483648)]",
 			filterConds: "[]",
 			resultStr:   "[[0,+inf]]",
+			length:      types.UnspecifiedLength,
+		},
+		{
+			colPos:      3,
+			exprStr:     "d = 'aab' or d = 'aac'",
+			accessConds: "[or(eq(test.t.d, aab), eq(test.t.d, aac))]",
+			filterConds: "[]",
+			resultStr:   "[[\"a\",\"a\"]]",
+			length:      1,
+		},
+		// This test case cannot be simplified to [1, 3] otherwise the index join will executes wrongly.
+		{
+			colPos:      0,
+			exprStr:     "a in (1, 2, 3)",
+			accessConds: "[in(test.t.a, 1, 2, 3)]",
+			filterConds: "",
+			resultStr:   "[[1,1] [2,2] [3,3]]",
+			length:      types.UnspecifiedLength,
 		},
 	}
 
+	ctx := context.Background()
 	for _, tt := range tests {
 		sql := "select * from t where " + tt.exprStr
-		ctx := testKit.Se.(sessionctx.Context)
-		stmts, err := session.Parse(ctx, sql)
+		sctx := testKit.Se.(sessionctx.Context)
+		stmts, err := session.Parse(sctx, sql)
 		c.Assert(err, IsNil, Commentf("error %v, for expr %s", err, tt.exprStr))
 		c.Assert(stmts, HasLen, 1)
-		is := domain.GetDomain(ctx).InfoSchema()
-		err = plannercore.Preprocess(ctx, stmts[0], is)
+		is := domain.GetDomain(sctx).InfoSchema()
+		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		sel := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
 		ds, ok := sel.Children()[0].(*plannercore.DataSource)
 		c.Assert(ok, IsTrue, Commentf("expr:%v", tt.exprStr))
-		conds := make([]expression.Expression, 0, len(sel.Conditions))
-		for _, cond := range sel.Conditions {
-			conds = append(conds, expression.PushDownNot(ctx, cond, false))
+		conds := make([]expression.Expression, len(sel.Conditions))
+		for i, cond := range sel.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
 		col := expression.ColInfo2Col(sel.Schema().Columns, ds.TableInfo().Columns[tt.colPos])
 		c.Assert(col, NotNil)
 		conds = ranger.ExtractAccessConditionsForColumn(conds, col.UniqueID)
 		c.Assert(fmt.Sprintf("%s", conds), Equals, tt.accessConds, Commentf("wrong access conditions for expr: %s", tt.exprStr))
-		result, err := ranger.BuildColumnRange(conds, new(stmtctx.StatementContext), col.RetType, types.UnspecifiedLength)
+		result, err := ranger.BuildColumnRange(conds, new(stmtctx.StatementContext), col.RetType, tt.length)
 		c.Assert(err, IsNil)
 		got := fmt.Sprintf("%v", result)
 		c.Assert(got, Equals, tt.resultStr, Commentf("different for expr %s, col: %v", tt.exprStr, col))
@@ -1021,9 +1085,9 @@ func (s *testRangerSuite) TestIndexRangeElimininatedProjection(c *C) {
 	testKit.MustQuery("explain select * from (select * from t union all select ifnull(a,b), b from t) sub where a > 0").Check(testkit.Rows(
 		"Union_11 2.00 root ",
 		"├─IndexReader_14 1.00 root index:IndexScan_13",
-		"│ └─IndexScan_13 1.00 cop table:t, index:a, b, range:(0,+inf], keep order:false",
+		"│ └─IndexScan_13 1.00 cop[tikv] table:t, index:a, b, range:(0,+inf], keep order:false",
 		"└─IndexReader_17 1.00 root index:IndexScan_16",
-		"  └─IndexScan_16 1.00 cop table:t, index:a, b, range:(0,+inf], keep order:false",
+		"  └─IndexScan_16 1.00 cop[tikv] table:t, index:a, b, range:(0,+inf], keep order:false",
 	))
 	testKit.MustQuery("select * from (select * from t union all select ifnull(a,b), b from t) sub where a > 0").Check(testkit.Rows(
 		"1 2",
@@ -1045,20 +1109,18 @@ func (s *testRangerSuite) TestCompIndexInExprCorrCol(c *C) {
 	testKit.MustExec("create table t(a int primary key, b int, c int, d int, e int, index idx(b,c,d))")
 	testKit.MustExec("insert into t values(1,1,1,1,2),(2,1,2,1,0)")
 	testKit.MustExec("analyze table t")
-	testKit.MustQuery("explain select t.e in (select count(*) from t s use index(idx), t t1 where s.b = 1 and s.c in (1, 2) and s.d = t.a and s.a = t1.a) from t").Check(testkit.Rows(
-		"Projection_11 2.00 root 9_aux_0",
-		"└─Apply_13 2.00 root left outer semi join, inner:StreamAgg_20, other cond:eq(test.t.e, 7_col_0)",
-		"  ├─TableReader_15 2.00 root data:TableScan_14",
-		"  │ └─TableScan_14 2.00 cop table:t, range:[-inf,+inf], keep order:false",
-		"  └─StreamAgg_20 1.00 root funcs:count(1)",
-		"    └─IndexJoin_32 2.00 root inner join, inner:TableReader_31, outer key:test.s.a, inner key:test.t1.a",
-		"      ├─IndexReader_27 2.00 root index:IndexScan_26",
-		"      │ └─IndexScan_26 2.00 cop table:s, index:b, c, d, range: decided by [eq(test.s.b, 1) in(test.s.c, 1, 2) eq(test.s.d, test.t.a)], keep order:false",
-		"      └─TableReader_31 1.00 root data:TableScan_30",
-		"        └─TableScan_30 1.00 cop table:t1, range: decided by [test.s.a], keep order:false",
-	))
-	testKit.MustQuery("select t.e in (select count(*) from t s use index(idx), t t1 where s.b = 1 and s.c in (1, 2) and s.d = t.a and s.a = t1.a) from t").Check(testkit.Rows(
-		"1",
-		"1",
-	))
+
+	var input []string
+	var output []struct {
+		SQL    string
+		Result []string
+	}
+	s.testData.GetTestCases(c, &input, &output)
+	for i, tt := range input {
+		s.testData.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Result = s.testData.ConvertRowsToStrings(testKit.MustQuery(tt).Rows())
+		})
+		testKit.MustQuery(tt).Check(testkit.Rows(output[i].Result...))
+	}
 }

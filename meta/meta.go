@@ -67,17 +67,14 @@ var (
 )
 
 var (
-	errInvalidTableKey = terror.ClassMeta.New(codeInvalidTableKey, "invalid table meta key")
-	errInvalidDBKey    = terror.ClassMeta.New(codeInvalidDBKey, "invalid db key")
-
 	// ErrDBExists is the error for db exists.
-	ErrDBExists = terror.ClassMeta.New(codeDatabaseExists, "database already exists")
+	ErrDBExists = terror.ClassMeta.New(mysql.ErrDBCreateExists, mysql.MySQLErrName[mysql.ErrDBCreateExists])
 	// ErrDBNotExists is the error for db not exists.
-	ErrDBNotExists = terror.ClassMeta.New(codeDatabaseNotExists, "database doesn't exist")
+	ErrDBNotExists = terror.ClassMeta.New(mysql.ErrBadDB, mysql.MySQLErrName[mysql.ErrBadDB])
 	// ErrTableExists is the error for table exists.
-	ErrTableExists = terror.ClassMeta.New(codeTableExists, "table already exists")
+	ErrTableExists = terror.ClassMeta.New(mysql.ErrTableExists, mysql.MySQLErrName[mysql.ErrTableExists])
 	// ErrTableNotExists is the error for table not exists.
-	ErrTableNotExists = terror.ClassMeta.New(codeTableNotExists, "table doesn't exist")
+	ErrTableNotExists = terror.ClassMeta.New(mysql.ErrNoSuchTable, mysql.MySQLErrName[mysql.ErrNoSuchTable])
 )
 
 // Meta is for handling meta information in a transaction.
@@ -115,6 +112,23 @@ func (m *Meta) GenGlobalID() (int64, error) {
 	defer globalIDMutex.Unlock()
 
 	return m.txn.Inc(mNextGlobalIDKey, 1)
+}
+
+// GenGlobalIDs generates the next n global IDs.
+func (m *Meta) GenGlobalIDs(n int) ([]int64, error) {
+	globalIDMutex.Lock()
+	defer globalIDMutex.Unlock()
+
+	newID, err := m.txn.Inc(mNextGlobalIDKey, int64(n))
+	if err != nil {
+		return nil, err
+	}
+	origID := newID - int64(n)
+	ids := make([]int64, 0, n)
+	for i := origID + 1; i <= newID; i++ {
+		ids = append(ids, i)
+	}
+	return ids, nil
 }
 
 // GetGlobalID gets current global id.
@@ -180,7 +194,7 @@ func (m *Meta) GenSchemaVersion() (int64, error) {
 func (m *Meta) checkDBExists(dbKey []byte) error {
 	v, err := m.txn.HGet(mDBs, dbKey)
 	if err == nil && v == nil {
-		err = ErrDBNotExists
+		err = ErrDBNotExists.GenWithStack("database doesn't exist")
 	}
 	return errors.Trace(err)
 }
@@ -188,7 +202,7 @@ func (m *Meta) checkDBExists(dbKey []byte) error {
 func (m *Meta) checkDBNotExists(dbKey []byte) error {
 	v, err := m.txn.HGet(mDBs, dbKey)
 	if err == nil && v != nil {
-		err = ErrDBExists
+		err = ErrDBExists.GenWithStack("database already exists")
 	}
 	return errors.Trace(err)
 }
@@ -196,7 +210,7 @@ func (m *Meta) checkDBNotExists(dbKey []byte) error {
 func (m *Meta) checkTableExists(dbKey []byte, tableKey []byte) error {
 	v, err := m.txn.HGet(dbKey, tableKey)
 	if err == nil && v == nil {
-		err = ErrTableNotExists
+		err = ErrTableNotExists.GenWithStack("table doesn't exist")
 	}
 	return errors.Trace(err)
 }
@@ -204,7 +218,7 @@ func (m *Meta) checkTableExists(dbKey []byte, tableKey []byte) error {
 func (m *Meta) checkTableNotExists(dbKey []byte, tableKey []byte) error {
 	v, err := m.txn.HGet(dbKey, tableKey)
 	if err == nil && v != nil {
-		err = ErrTableExists
+		err = ErrTableExists.GenWithStack("table already exists")
 	}
 	return errors.Trace(err)
 }
@@ -456,8 +470,13 @@ func (m *Meta) enQueueDDLJob(key []byte, job *model.Job) error {
 }
 
 // EnQueueDDLJob adds a DDL job to the list.
-func (m *Meta) EnQueueDDLJob(job *model.Job) error {
-	return m.enQueueDDLJob(m.jobListKey, job)
+func (m *Meta) EnQueueDDLJob(job *model.Job, jobListKeys ...JobListKeyType) error {
+	listKey := m.jobListKey
+	if len(jobListKeys) != 0 {
+		listKey = jobListKeys[0]
+	}
+
+	return m.enQueueDDLJob(listKey, job)
 }
 
 func (m *Meta) deQueueDDLJob(key []byte) (*model.Job, error) {
@@ -603,8 +622,8 @@ func (m *Meta) reorgJobPhysicalTableID(id int64) []byte {
 	return b
 }
 
-func (m *Meta) addHistoryDDLJob(key []byte, job *model.Job) error {
-	b, err := job.Encode(true)
+func (m *Meta) addHistoryDDLJob(key []byte, job *model.Job, updateRawArgs bool) error {
+	b, err := job.Encode(updateRawArgs)
 	if err == nil {
 		err = m.txn.HSet(key, m.jobIDKey(job.ID), b)
 	}
@@ -612,8 +631,8 @@ func (m *Meta) addHistoryDDLJob(key []byte, job *model.Job) error {
 }
 
 // AddHistoryDDLJob adds DDL job to history.
-func (m *Meta) AddHistoryDDLJob(job *model.Job) error {
-	return m.addHistoryDDLJob(mDDLJobHistoryKey, job)
+func (m *Meta) AddHistoryDDLJob(job *model.Job, updateRawArgs bool) error {
+	return m.addHistoryDDLJob(mDDLJobHistoryKey, job, updateRawArgs)
 }
 
 func (m *Meta) getHistoryDDLJob(key []byte, id int64) (*model.Job, error) {
@@ -798,23 +817,12 @@ func (m *Meta) SetSchemaDiff(diff *model.SchemaDiff) error {
 	return errors.Trace(err)
 }
 
-// meta error codes.
-const (
-	codeInvalidTableKey terror.ErrCode = 1
-	codeInvalidDBKey                   = 2
-
-	codeDatabaseExists    = 1007
-	codeDatabaseNotExists = 1049
-	codeTableExists       = 1050
-	codeTableNotExists    = 1146
-)
-
 func init() {
 	metaMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeDatabaseExists:    mysql.ErrDBCreateExists,
-		codeDatabaseNotExists: mysql.ErrBadDB,
-		codeTableNotExists:    mysql.ErrNoSuchTable,
-		codeTableExists:       mysql.ErrTableExists,
+		mysql.ErrDBCreateExists: mysql.ErrDBCreateExists,
+		mysql.ErrBadDB:          mysql.ErrBadDB,
+		mysql.ErrNoSuchTable:    mysql.ErrNoSuchTable,
+		mysql.ErrTableExists:    mysql.ErrTableExists,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassMeta] = metaMySQLErrCodes
 }

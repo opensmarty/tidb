@@ -16,7 +16,9 @@ package tikv_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
+	"testing"
 	"time"
 
 	. "github.com/pingcap/check"
@@ -51,23 +53,6 @@ func (s *testSQLSuite) TearDownSuite(c *C) {
 	s.OneByOneSuite.TearDownSuite(c)
 }
 
-func (s *testSQLSuite) TestInsertSleepOverMaxTxnTime(c *C) {
-	defer func() {
-		c.Assert(failpoint.Disable("github.com/pingcap/tidb/store/tmpMaxTxnTime"), IsNil)
-	}()
-	se, err := session.CreateSession4Test(s.store)
-	c.Assert(err, IsNil)
-	_, err = se.Execute(context.Background(), "drop table if exists test.t")
-	c.Assert(err, IsNil)
-	_, err = se.Execute(context.Background(), "create table test.t(a int)")
-	c.Assert(err, IsNil)
-	c.Assert(failpoint.Enable("github.com/pingcap/tidb/store/tmpMaxTxnTime", `return(2)->return(0)`), IsNil)
-	start := time.Now()
-	_, err = se.Execute(context.Background(), "insert into test.t (a) select sleep(3)")
-	c.Assert(err, IsNil)
-	c.Assert(time.Since(start) < time.Second*5, IsTrue)
-}
-
 func (s *testSQLSuite) TestFailBusyServerCop(c *C) {
 	se, err := session.CreateSession4Test(s.store)
 	c.Assert(err, IsNil)
@@ -99,6 +84,11 @@ func (s *testSQLSuite) TestFailBusyServerCop(c *C) {
 	wg.Wait()
 }
 
+func TestMain(m *testing.M) {
+	ReadTimeoutMedium = 2 * time.Second
+	os.Exit(m.Run())
+}
+
 func (s *testSQLSuite) TestCoprocessorStreamRecvTimeout(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -106,31 +96,85 @@ func (s *testSQLSuite) TestCoprocessorStreamRecvTimeout(c *C) {
 	for i := 0; i < 200; i++ {
 		tk.MustExec(fmt.Sprintf("insert into t values (%d)", i))
 	}
+	tk.Se.GetSessionVars().EnableStreaming = true
 
-	// rowsPerChunk in MockTiKV is 64, so the result will be 4 chunks.
-	enable := true
-	ctx := context.WithValue(context.Background(), mock.HookKeyForTest("mockTiKVStreamRecvHook"), func(ctx context.Context) {
-		if !enable {
-			return
-		}
+	{
+		enable := true
+		visited := make(chan int, 1)
+		timeouted := false
+		timeout := ReadTimeoutMedium + 100*time.Second
+		ctx := context.WithValue(context.Background(), mock.HookKeyForTest("mockTiKVStreamRecvHook"), func(ctx context.Context) {
+			if !enable {
+				return
+			}
+			visited <- 1
 
-		select {
-		case <-ctx.Done():
-		case <-time.After(time.Minute):
-		}
-		enable = false
-	})
+			select {
+			case <-ctx.Done():
+			case <-time.After(timeout):
+				timeouted = true
+			}
+			enable = false
+		})
 
-	res, err := tk.Se.Execute(ctx, "select * from t")
-	c.Assert(err, IsNil)
-
-	req := res[0].NewChunk()
-	for {
-		err := res[0].Next(ctx, req)
+		res, err := tk.Se.Execute(ctx, "select * from t")
 		c.Assert(err, IsNil)
-		if req.NumRows() == 0 {
-			break
+
+		req := res[0].NewChunk()
+		for i := 0; ; i++ {
+			err := res[0].Next(ctx, req)
+			c.Assert(err, IsNil)
+			if req.NumRows() == 0 {
+				break
+			}
+			req.Reset()
 		}
-		req.Reset()
+		select {
+		case <-visited:
+			// run with mocktikv
+			c.Assert(timeouted, IsFalse)
+		default:
+			// run with real tikv
+		}
+	}
+
+	{
+		enable := true
+		visited := make(chan int, 1)
+		timeouted := false
+		timeout := 1 * time.Millisecond
+		ctx := context.WithValue(context.Background(), mock.HookKeyForTest("mockTiKVStreamRecvHook"), func(ctx context.Context) {
+			if !enable {
+				return
+			}
+			visited <- 1
+
+			select {
+			case <-ctx.Done():
+			case <-time.After(timeout):
+				timeouted = true
+			}
+			enable = false
+		})
+
+		res, err := tk.Se.Execute(ctx, "select * from t")
+		c.Assert(err, IsNil)
+
+		req := res[0].NewChunk()
+		for i := 0; ; i++ {
+			err := res[0].Next(ctx, req)
+			c.Assert(err, IsNil)
+			if req.NumRows() == 0 {
+				break
+			}
+			req.Reset()
+		}
+		select {
+		case <-visited:
+			// run with mocktikv
+			c.Assert(timeouted, IsTrue)
+		default:
+			// run with real tikv
+		}
 	}
 }

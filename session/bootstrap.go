@@ -72,6 +72,7 @@ const (
 		Create_role_priv		ENUM('N','Y') NOT NULL DEFAULT 'N',
 		Drop_role_priv			ENUM('N','Y') NOT NULL DEFAULT 'N',
 		Account_locked			ENUM('N','Y') NOT NULL DEFAULT 'N',
+		Shutdown_priv			ENUM('N','Y') NOT NULL DEFAULT 'N',
 		PRIMARY KEY (Host, User));`
 	// CreateDBPrivTable is the SQL statement creates DB scope privilege table in system db.
 	CreateDBPrivTable = `CREATE TABLE if not exists mysql.db (
@@ -264,6 +265,11 @@ const (
 	CreateExprPushdownBlacklist = `CREATE TABLE IF NOT EXISTS mysql.expr_pushdown_blacklist (
 		name char(100) NOT NULL
 	);`
+
+	// CreateOptRuleBlacklist stores the list of disabled optimizing operations.
+	CreateOptRuleBlacklist = `CREATE TABLE IF NOT EXISTS mysql.opt_rule_blacklist (
+		name char(100) NOT NULL
+	);`
 )
 
 // bootstrap initiates system DB for a store.
@@ -342,6 +348,10 @@ const (
 	version31 = 31
 	version32 = 32
 	version33 = 33
+	version34 = 34
+	version35 = 35
+	version36 = 36
+	version37 = 37
 )
 
 func checkBootstrapped(s Session) (bool, error) {
@@ -513,6 +523,7 @@ func upgrade(s Session) {
 		upgradeToVer28(s)
 	}
 
+	// upgradeToVer29 only need to be run when the current version is 28.
 	if ver == version28 {
 		upgradeToVer29(s)
 	}
@@ -526,11 +537,27 @@ func upgrade(s Session) {
 	}
 
 	if ver < version32 {
-		upgradeToVer29(s)
+		upgradeToVer32(s)
 	}
 
 	if ver < version33 {
 		upgradeToVer33(s)
+	}
+
+	if ver < version34 {
+		upgradeToVer34(s)
+	}
+
+	if ver < version35 {
+		upgradeToVer35(s)
+	}
+
+	if ver < version36 {
+		upgradeToVer36(s)
+	}
+
+	if ver < version37 {
+		upgradeToVer37(s)
 	}
 
 	updateBootstrapVer(s)
@@ -839,6 +866,29 @@ func upgradeToVer33(s Session) {
 	doReentrantDDL(s, CreateExprPushdownBlacklist)
 }
 
+func upgradeToVer34(s Session) {
+	doReentrantDDL(s, CreateOptRuleBlacklist)
+}
+
+func upgradeToVer35(s Session) {
+	sql := fmt.Sprintf("UPDATE HIGH_PRIORITY %s.%s SET VARIABLE_NAME = '%s' WHERE VARIABLE_NAME = 'tidb_back_off_weight'",
+		mysql.SystemDB, mysql.GlobalVariablesTable, variable.TiDBBackOffWeight)
+	mustExecute(s, sql)
+}
+
+func upgradeToVer36(s Session) {
+	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Shutdown_priv` ENUM('N','Y') DEFAULT 'N'", infoschema.ErrColumnExists)
+	// A root user will have those privileges after upgrading.
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET Shutdown_priv='Y' where User = 'root'")
+}
+
+func upgradeToVer37(s Session) {
+	// when upgrade from old tidb and no 'tidb_enable_window_function' in GLOBAL_VARIABLES, init it with 0.
+	sql := fmt.Sprintf("INSERT IGNORE INTO  %s.%s (`VARIABLE_NAME`, `VARIABLE_VALUE`) VALUES ('%s', '%d')",
+		mysql.SystemDB, mysql.GlobalVariablesTable, variable.TiDBEnableWindowFunction, 0)
+	mustExecute(s, sql)
+}
+
 // updateBootstrapVer updates bootstrap version variable in mysql.TiDB table.
 func updateBootstrapVer(s Session) {
 	// Update bootstrap version.
@@ -899,6 +949,8 @@ func doDDLWorks(s Session) {
 	mustExecute(s, CreateStatsTopNTable)
 	// Create expr_pushdown_blacklist table.
 	mustExecute(s, CreateExprPushdownBlacklist)
+	// Create opt_rule_blacklist table.
+	mustExecute(s, CreateOptRuleBlacklist)
 }
 
 // doDMLWorks executes DML statements in bootstrap stage.
@@ -908,7 +960,7 @@ func doDMLWorks(s Session) {
 
 	// Insert a default user with empty password.
 	mustExecute(s, `INSERT HIGH_PRIORITY INTO mysql.user VALUES
-		("%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")`)
+		("%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N", "Y")`)
 
 	// Init global system variables table.
 	values := make([]string, 0, len(variable.SysVars))

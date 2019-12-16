@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,7 +30,6 @@ import (
 
 // Handle is the handler for expensive query.
 type Handle struct {
-	mu     sync.RWMutex
 	exitCh chan struct{}
 	sm     util.SessionManager
 }
@@ -54,12 +52,13 @@ func (eqh *Handle) Run() {
 	// use 100ms as tickInterval temply, may use given interval or use defined variable later
 	tickInterval := time.Millisecond * time.Duration(100)
 	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			processInfo := eqh.sm.ShowProcessList()
 			for _, info := range processInfo {
-				if info.Info == nil || info.ExceedExpensiveTimeThresh {
+				if len(info.Info) == 0 || info.ExceedExpensiveTimeThresh {
 					continue
 				}
 				costTime := time.Since(info.Time)
@@ -90,8 +89,7 @@ func (eqh *Handle) LogOnQueryExceedMemQuota(connID uint64) {
 	logExpensiveQuery(time.Since(info.Time), info)
 }
 
-// logExpensiveQuery logs the queries which exceed the time threshold or memory threshold.
-func logExpensiveQuery(costTime time.Duration, info *util.ProcessInfo) {
+func genLogFields(costTime time.Duration, info *util.ProcessInfo) []zap.Field {
 	logFields := make([]zap.Field, 0, 20)
 	logFields = append(logFields, zap.String("cost_time", strconv.FormatFloat(costTime.Seconds(), 'f', -1, 64)+"s"))
 	execDetail := info.StmtCtx.GetExecDetails()
@@ -124,32 +122,36 @@ func logExpensiveQuery(costTime time.Duration, info *util.ProcessInfo) {
 	if len(info.User) > 0 {
 		logFields = append(logFields, zap.String("user", info.User))
 	}
-	if info.DB != nil && len(info.DB.(string)) > 0 {
-		logFields = append(logFields, zap.String("database", info.DB.(string)))
+	if len(info.DB) > 0 {
+		logFields = append(logFields, zap.String("database", info.DB))
 	}
-	var tableIDs, indexIDs string
+	var tableIDs, indexNames string
 	if len(info.StmtCtx.TableIDs) > 0 {
 		tableIDs = strings.Replace(fmt.Sprintf("%v", info.StmtCtx.TableIDs), " ", ",", -1)
 		logFields = append(logFields, zap.String("table_ids", tableIDs))
 	}
-	if len(info.StmtCtx.IndexIDs) > 0 {
-		indexIDs = strings.Replace(fmt.Sprintf("%v", info.StmtCtx.IndexIDs), " ", ",", -1)
-		logFields = append(logFields, zap.String("index_ids", indexIDs))
+	if len(info.StmtCtx.IndexNames) > 0 {
+		indexNames = strings.Replace(fmt.Sprintf("%v", info.StmtCtx.IndexNames), " ", ",", -1)
+		logFields = append(logFields, zap.String("index_names", indexNames))
 	}
 	logFields = append(logFields, zap.Uint64("txn_start_ts", info.CurTxnStartTS))
 	if memTracker := info.StmtCtx.MemTracker; memTracker != nil {
-		logFields = append(logFields, zap.String("mem_max", memTracker.BytesToString(memTracker.MaxConsumed())))
+		logFields = append(logFields, zap.String("mem_max", fmt.Sprintf("%d Bytes (%v)", memTracker.MaxConsumed(), memTracker.BytesToString(memTracker.MaxConsumed()))))
 	}
 
 	const logSQLLen = 1024 * 8
 	var sql string
-	if info.Info != nil {
-		sql = info.Info.(string)
+	if len(info.Info) > 0 {
+		sql = info.Info
 	}
 	if len(sql) > logSQLLen {
 		sql = fmt.Sprintf("%s len(%d)", sql[:logSQLLen], len(sql))
 	}
 	logFields = append(logFields, zap.String("sql", sql))
+	return logFields
+}
 
-	logutil.BgLogger().Warn("expensive_query", logFields...)
+// logExpensiveQuery logs the queries which exceed the time threshold or memory threshold.
+func logExpensiveQuery(costTime time.Duration, info *util.ProcessInfo) {
+	logutil.BgLogger().Warn("expensive_query", genLogFields(costTime, info)...)
 }

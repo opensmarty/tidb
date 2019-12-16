@@ -20,11 +20,13 @@ import (
 	"strings"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/opcode"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
@@ -34,7 +36,6 @@ import (
 
 const (
 	partitionMaxValue = "MAXVALUE"
-	primarykey        = "PRIMARY KEY"
 )
 
 // buildTablePartitionInfo builds partition info and checks for some errors.
@@ -137,7 +138,7 @@ func buildHashPartitionDefinitions(ctx sessionctx.Context, d *ddl, s *ast.Create
 func buildRangePartitionDefinitions(ctx sessionctx.Context, d *ddl, s *ast.CreateTableStmt, pi *model.PartitionInfo) error {
 	genIDs, err := d.genGlobalIDs(len(s.Partition.Definitions))
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	for ith, def := range s.Partition.Definitions {
 		comment, _ := def.Comment()
@@ -159,7 +160,19 @@ func buildRangePartitionDefinitions(ctx sessionctx.Context, d *ddl, s *ast.Creat
 	return nil
 }
 
-func checkPartitionNameUnique(tbInfo *model.TableInfo, pi *model.PartitionInfo) error {
+func checkPartitionNameUnique(pi *model.PartitionInfo) error {
+	partNames := make(map[string]struct{})
+	newPars := pi.Definitions
+	for _, newPar := range newPars {
+		if _, ok := partNames[newPar.Name.L]; ok {
+			return ErrSameNamePartition.GenWithStackByArgs(newPar.Name)
+		}
+		partNames[newPar.Name.L] = struct{}{}
+	}
+	return nil
+}
+
+func checkAddPartitionNameUnique(tbInfo *model.TableInfo, pi *model.PartitionInfo) error {
 	partNames := make(map[string]struct{})
 	if tbInfo.Partition != nil {
 		oldPars := tbInfo.Partition.Definitions
@@ -177,15 +190,65 @@ func checkPartitionNameUnique(tbInfo *model.TableInfo, pi *model.PartitionInfo) 
 	return nil
 }
 
+func checkAndOverridePartitionID(newTableInfo, oldTableInfo *model.TableInfo) error {
+	// If any old partitionInfo has lost, that means the partition ID lost too, so did the data, repair failed.
+	if newTableInfo.Partition == nil {
+		return nil
+	}
+	if oldTableInfo.Partition == nil {
+		return ErrRepairTableFail.GenWithStackByArgs("Old table doesn't have partitions")
+	}
+	if newTableInfo.Partition.Type != oldTableInfo.Partition.Type {
+		return ErrRepairTableFail.GenWithStackByArgs("Partition type should be the same")
+	}
+	// Check whether partitionType is hash partition.
+	if newTableInfo.Partition.Type == model.PartitionTypeHash {
+		if newTableInfo.Partition.Num != oldTableInfo.Partition.Num {
+			return ErrRepairTableFail.GenWithStackByArgs("Hash partition num should be the same")
+		}
+	}
+	for i, newOne := range newTableInfo.Partition.Definitions {
+		found := false
+		for _, oldOne := range oldTableInfo.Partition.Definitions {
+			if newOne.Name.L == oldOne.Name.L && stringSliceEqual(newOne.LessThan, oldOne.LessThan) {
+				newTableInfo.Partition.Definitions[i].ID = oldOne.ID
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrRepairTableFail.GenWithStackByArgs("Partition " + newOne.Name.L + " has lost")
+		}
+	}
+	return nil
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	// Accelerate the compare by eliminate index bound check.
+	b = b[:len(a)]
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // See https://github.com/mysql/mysql-server/blob/5.7/sql/item_func.h#L387
 func hasTimestampField(ctx sessionctx.Context, tblInfo *model.TableInfo, expr ast.ExprNode) (bool, error) {
-	partCols, err := partitionColumns(ctx, tblInfo, expr)
+	partCols, err := checkPartitionColumns(tblInfo, expr)
 	if err != nil {
 		return false, err
 	}
 
 	for _, c := range partCols {
-		if c.GetType().Tp == mysql.TypeTimestamp {
+		if c.FieldType.Tp == mysql.TypeTimestamp {
 			return true, nil
 		}
 	}
@@ -195,13 +258,13 @@ func hasTimestampField(ctx sessionctx.Context, tblInfo *model.TableInfo, expr as
 
 // See https://github.com/mysql/mysql-server/blob/5.7/sql/item_func.h#L399
 func hasDateField(ctx sessionctx.Context, tblInfo *model.TableInfo, expr ast.ExprNode) (bool, error) {
-	partCols, err := partitionColumns(ctx, tblInfo, expr)
+	partCols, err := checkPartitionColumns(tblInfo, expr)
 	if err != nil {
 		return false, err
 	}
 
 	for _, c := range partCols {
-		if c.GetType().Tp == mysql.TypeDate || c.GetType().Tp == mysql.TypeDatetime {
+		if c.FieldType.Tp == mysql.TypeDate || c.FieldType.Tp == mysql.TypeDatetime {
 			return true, nil
 		}
 	}
@@ -211,13 +274,13 @@ func hasDateField(ctx sessionctx.Context, tblInfo *model.TableInfo, expr ast.Exp
 
 // See https://github.com/mysql/mysql-server/blob/5.7/sql/item_func.h#L412
 func hasTimeField(ctx sessionctx.Context, tblInfo *model.TableInfo, expr ast.ExprNode) (bool, error) {
-	partCols, err := partitionColumns(ctx, tblInfo, expr)
+	partCols, err := checkPartitionColumns(tblInfo, expr)
 	if err != nil {
 		return false, err
 	}
 
 	for _, c := range partCols {
-		if c.GetType().Tp == mysql.TypeDatetime || c.GetType().Tp == mysql.TypeDuration {
+		if c.FieldType.Tp == mysql.TypeDatetime || c.FieldType.Tp == mysql.TypeDuration {
 			return true, nil
 		}
 	}
@@ -283,7 +346,7 @@ func checkPartitionFuncValid(ctx sessionctx.Context, tblInfo *model.TableInfo, e
 	}
 
 	// check constant.
-	_, err := partitionColumns(ctx, tblInfo, expr)
+	_, err := checkPartitionColumns(tblInfo, expr)
 	return err
 }
 
@@ -302,12 +365,12 @@ func checkPartitionFunc(isTimezoneDependent bool, err error) error {
 	return nil
 }
 
-func partitionColumns(ctx sessionctx.Context, tblInfo *model.TableInfo, expr ast.ExprNode) ([]*expression.Column, error) {
+func checkPartitionColumns(tblInfo *model.TableInfo, expr ast.ExprNode) ([]*model.ColumnInfo, error) {
 	buf := new(bytes.Buffer)
 	expr.Format(buf)
-	partCols, err := extractPartitionColumns(ctx, buf.String(), tblInfo)
+	partCols, err := extractPartitionColumns(buf.String(), tblInfo)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	if len(partCols) == 0 {
@@ -589,17 +652,22 @@ func getPartitionIDs(table *model.TableInfo) []int64 {
 // checkRangePartitioningKeysConstraints checks that the range partitioning key is included in the table constraint.
 func checkRangePartitioningKeysConstraints(sctx sessionctx.Context, s *ast.CreateTableStmt, tblInfo *model.TableInfo, constraints []*ast.Constraint) error {
 	// Returns directly if there is no constraint in the partition table.
-	// TODO: Remove the test 's.Partition.Expr == nil' when we support 'PARTITION BY RANGE COLUMNS'
-	if len(constraints) == 0 || s.Partition.Expr == nil {
+	if len(constraints) == 0 {
 		return nil
 	}
 
-	// Parse partitioning key, extract the column names in the partitioning key to slice.
-	buf := new(bytes.Buffer)
-	s.Partition.Expr.Format(buf)
-	partCols, err := extractPartitionColumns(sctx, buf.String(), tblInfo)
-	if err != nil {
-		return err
+	var partCols stringSlice
+	if s.Partition.Expr != nil {
+		// Parse partitioning key, extract the column names in the partitioning key to slice.
+		buf := new(bytes.Buffer)
+		s.Partition.Expr.Format(buf)
+		partColumns, err := extractPartitionColumns(buf.String(), tblInfo)
+		if err != nil {
+			return err
+		}
+		partCols = columnInfoSlice(partColumns)
+	} else if len(s.Partition.ColumnNames) > 0 {
+		partCols = columnNameSlice(s.Partition.ColumnNames)
 	}
 
 	// Checks that the partitioning key is included in the constraint.
@@ -619,37 +687,121 @@ func checkRangePartitioningKeysConstraints(sctx sessionctx.Context, s *ast.Creat
 	return nil
 }
 
-func checkPartitionKeysConstraint(sctx sessionctx.Context, partExpr string, idxColNames []*ast.IndexColName, tblInfo *model.TableInfo) error {
-	// Parse partitioning key, extract the column names in the partitioning key to slice.
-	partCols, err := extractPartitionColumns(sctx, partExpr, tblInfo)
-	if err != nil {
-		return err
+func checkPartitionKeysConstraint(pi *model.PartitionInfo, idxColNames []*ast.IndexPartSpecification, tblInfo *model.TableInfo, isPK bool) error {
+	var (
+		partCols []*model.ColumnInfo
+		err      error
+	)
+	// The expr will be an empty string if the partition is defined by:
+	// CREATE TABLE t (...) PARTITION BY RANGE COLUMNS(...)
+	if partExpr := pi.Expr; partExpr != "" {
+		// Parse partitioning key, extract the column names in the partitioning key to slice.
+		partCols, err = extractPartitionColumns(partExpr, tblInfo)
+		if err != nil {
+			return err
+		}
+	} else {
+		partCols = make([]*model.ColumnInfo, 0, len(pi.Columns))
+		for _, col := range pi.Columns {
+			colInfo := getColumnInfoByName(tblInfo, col.L)
+			if colInfo == nil {
+				return infoschema.ErrColumnNotExists.GenWithStackByArgs(col, tblInfo.Name)
+			}
+			partCols = append(partCols, colInfo)
+		}
 	}
 
-	// Every unique key on the table must use every column in the table's partitioning expression.
+	// Every unique key on the table must use every column in the table's partitioning expression.(This
+	// also includes the table's primary key.)
 	// See https://dev.mysql.com/doc/refman/5.7/en/partitioning-limitations-partitioning-keys-unique-keys.html
-	if !checkUniqueKeyIncludePartKey(partCols, idxColNames) {
+	if !checkUniqueKeyIncludePartKey(columnInfoSlice(partCols), idxColNames) {
+		if isPK {
+			return ErrUniqueKeyNeedAllFieldsInPf.GenWithStackByArgs("PRIMARY")
+		}
 		return ErrUniqueKeyNeedAllFieldsInPf.GenWithStackByArgs("UNIQUE INDEX")
 	}
 	return nil
 }
 
-func extractPartitionColumns(sctx sessionctx.Context, partExpr string, tblInfo *model.TableInfo) ([]*expression.Column, error) {
-	e, err := expression.ParseSimpleExprWithTableInfo(sctx, partExpr, tblInfo)
-	if err != nil {
-		return nil, errors.Trace(err)
+type columnNameExtractor struct {
+	extractedColumns []*model.ColumnInfo
+	tblInfo          *model.TableInfo
+	err              error
+}
+
+func (cne *columnNameExtractor) Enter(node ast.Node) (ast.Node, bool) {
+	return node, false
+}
+
+func (cne *columnNameExtractor) Leave(node ast.Node) (ast.Node, bool) {
+	if c, ok := node.(*ast.ColumnNameExpr); ok {
+		for _, info := range cne.tblInfo.Columns {
+			if info.Name.L == c.Name.Name.L {
+				cne.extractedColumns = append(cne.extractedColumns, info)
+				return node, true
+			}
+		}
+		cne.err = ErrBadField.GenWithStackByArgs(c.Name.Name.O, "expression")
+		return nil, false
 	}
-	return expression.ExtractColumns(e), nil
+	return node, true
+}
+
+func extractPartitionColumns(partExpr string, tblInfo *model.TableInfo) ([]*model.ColumnInfo, error) {
+	partExpr = "select " + partExpr
+	stmts, _, err := parser.New().Parse(partExpr, "", "")
+	if err != nil {
+		return nil, err
+	}
+	extractor := &columnNameExtractor{
+		tblInfo:          tblInfo,
+		extractedColumns: make([]*model.ColumnInfo, 0),
+	}
+	stmts[0].Accept(extractor)
+	if extractor.err != nil {
+		return nil, extractor.err
+	}
+	return extractor.extractedColumns, nil
+}
+
+// stringSlice is defined for checkUniqueKeyIncludePartKey.
+// if Go supports covariance, the code shouldn't be so complex.
+type stringSlice interface {
+	Len() int
+	At(i int) string
 }
 
 // checkUniqueKeyIncludePartKey checks that the partitioning key is included in the constraint.
-func checkUniqueKeyIncludePartKey(partCols []*expression.Column, idxCols []*ast.IndexColName) bool {
-	for _, partCol := range partCols {
+func checkUniqueKeyIncludePartKey(partCols stringSlice, idxCols []*ast.IndexPartSpecification) bool {
+	for i := 0; i < partCols.Len(); i++ {
+		partCol := partCols.At(i)
 		if !findColumnInIndexCols(partCol, idxCols) {
 			return false
 		}
 	}
 	return true
+}
+
+// columnInfoSlice implements the stringSlice interface.
+type columnInfoSlice []*model.ColumnInfo
+
+func (cis columnInfoSlice) Len() int {
+	return len(cis)
+}
+
+func (cis columnInfoSlice) At(i int) string {
+	return cis[i].Name.L
+}
+
+// columnNameSlice implements the stringSlice interface.
+type columnNameSlice []*ast.ColumnName
+
+func (cns columnNameSlice) Len() int {
+	return len(cns)
+}
+
+func (cns columnNameSlice) At(i int) string {
+	return cns[i].Name.L
 }
 
 // isRangePartitionColUnsignedBigint returns true if the partitioning key column type is unsigned bigint type.

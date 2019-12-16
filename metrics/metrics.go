@@ -41,6 +41,10 @@ const (
 
 	opSucc   = "ok"
 	opFailed = "err"
+
+	LableScope   = "scope"
+	ScopeGlobal  = "global"
+	ScopeSession = "session"
 )
 
 // RetLabel returns "ok" when err == nil and "err" when err != nil.
@@ -58,11 +62,15 @@ func RegisterMetrics() {
 	prometheus.MustRegister(AutoAnalyzeHistogram)
 	prometheus.MustRegister(AutoIDHistogram)
 	prometheus.MustRegister(BatchAddIdxHistogram)
+	prometheus.MustRegister(BindUsageCounter)
+	prometheus.MustRegister(BindTotalGauge)
+	prometheus.MustRegister(BindMemoryUsage)
 	prometheus.MustRegister(CampaignOwnerCounter)
 	prometheus.MustRegister(ConnGauge)
 	prometheus.MustRegister(PreparedStmtGauge)
 	prometheus.MustRegister(CriticalErrorCounter)
 	prometheus.MustRegister(DDLCounter)
+	prometheus.MustRegister(AddIndexTotalCounter)
 	prometheus.MustRegister(DDLWorkerHistogram)
 	prometheus.MustRegister(DeploySyncerHistogram)
 	prometheus.MustRegister(DistSQLPartialCountHistogram)
@@ -103,6 +111,7 @@ func RegisterMetrics() {
 	prometheus.MustRegister(StmtNodeCounter)
 	prometheus.MustRegister(DbStmtNodeCounter)
 	prometheus.MustRegister(StoreQueryFeedbackCounter)
+	prometheus.MustRegister(GetStoreLimitErrorCounter)
 	prometheus.MustRegister(TiKVBackoffCounter)
 	prometheus.MustRegister(TiKVBackoffHistogram)
 	prometheus.MustRegister(TiKVCoprocessorHistogram)
@@ -145,4 +154,8 @@ func RegisterMetrics() {
 	prometheus.MustRegister(TiKVBatchClientUnavailable)
 	prometheus.MustRegister(TiKVRangeTaskStats)
 	prometheus.MustRegister(TiKVRangeTaskPushDuration)
+	prometheus.MustRegister(HandleSchemaValidate)
+	prometheus.MustRegister(TiKVTokenWaitDuration)
+	prometheus.MustRegister(TiKVTxnHeartBeatHistogram)
+	prometheus.MustRegister(GRPCConnTransientFailureCounter)
 }

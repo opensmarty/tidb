@@ -14,6 +14,7 @@
 package core
 
 import (
+	"context"
 	"math"
 
 	"github.com/pingcap/errors"
@@ -26,11 +27,13 @@ import (
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/set"
 	"go.uber.org/atomic"
 )
 
 // OptimizeAstNode optimizes the query to a physical plan directly.
-var OptimizeAstNode func(ctx sessionctx.Context, node ast.Node, is infoschema.InfoSchema) (Plan, error)
+var OptimizeAstNode func(ctx context.Context, sctx sessionctx.Context, node ast.Node, is infoschema.InfoSchema) (Plan, types.NameSlice, error)
 
 // AllowCartesianProduct means whether tidb allows cartesian join without equal conditions.
 var AllowCartesianProduct = atomic.NewBool(true)
@@ -55,7 +58,7 @@ var optRuleList = []logicalOptRule{
 	&buildKeySolver{},
 	&decorrelateSolver{},
 	&aggregationEliminator{},
-	&projectionEliminater{},
+	&projectionEliminator{},
 	&maxMinEliminator{},
 	&ppdSolver{},
 	&outerJoinEliminator{},
@@ -67,19 +70,20 @@ var optRuleList = []logicalOptRule{
 
 // logicalOptRule means a logical optimizing rule, which contains decorrelate, ppd, column pruning, etc.
 type logicalOptRule interface {
-	optimize(LogicalPlan) (LogicalPlan, error)
+	optimize(context.Context, LogicalPlan) (LogicalPlan, error)
+	name() string
 }
 
 // BuildLogicalPlan used to build logical plan from ast.Node.
-func BuildLogicalPlan(ctx sessionctx.Context, node ast.Node, is infoschema.InfoSchema) (Plan, error) {
-	ctx.GetSessionVars().PlanID = 0
-	ctx.GetSessionVars().PlanColumnID = 0
-	builder := NewPlanBuilder(ctx, is)
-	p, err := builder.Build(node)
+func BuildLogicalPlan(ctx context.Context, sctx sessionctx.Context, node ast.Node, is infoschema.InfoSchema) (Plan, types.NameSlice, error) {
+	sctx.GetSessionVars().PlanID = 0
+	sctx.GetSessionVars().PlanColumnID = 0
+	builder := NewPlanBuilder(sctx, is, &BlockHintProcessor{})
+	p, err := builder.Build(ctx, node)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return p, nil
+	return p, p.OutputNames(), err
 }
 
 // CheckPrivilege checks the privilege for a user.
@@ -111,20 +115,20 @@ func CheckTableLock(ctx sessionctx.Context, is infoschema.InfoSchema, vs []visit
 }
 
 // DoOptimize optimizes a logical plan to a physical plan.
-func DoOptimize(flag uint64, logic LogicalPlan) (PhysicalPlan, error) {
-	logic, err := logicalOptimize(flag, logic)
+func DoOptimize(ctx context.Context, flag uint64, logic LogicalPlan) (PhysicalPlan, float64, error) {
+	logic, err := logicalOptimize(ctx, flag, logic)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !AllowCartesianProduct.Load() && existsCartesianProduct(logic) {
-		return nil, errors.Trace(ErrCartesianProductUnsupported)
+		return nil, 0, errors.Trace(ErrCartesianProductUnsupported)
 	}
-	physical, err := physicalOptimize(logic)
+	physical, cost, err := physicalOptimize(logic)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	finalPlan := postOptimize(physical)
-	return finalPlan, nil
+	return finalPlan, cost, nil
 }
 
 func postOptimize(plan PhysicalPlan) PhysicalPlan {
@@ -133,16 +137,16 @@ func postOptimize(plan PhysicalPlan) PhysicalPlan {
 	return plan
 }
 
-func logicalOptimize(flag uint64, logic LogicalPlan) (LogicalPlan, error) {
+func logicalOptimize(ctx context.Context, flag uint64, logic LogicalPlan) (LogicalPlan, error) {
 	var err error
 	for i, rule := range optRuleList {
 		// The order of flags is same as the order of optRule in the list.
 		// We use a bitmask to record which opt rules should be used. If the i-th bit is 1, it means we should
 		// apply i-th optimizing rule.
-		if flag&(1<<uint(i)) == 0 {
+		if flag&(1<<uint(i)) == 0 || isLogicalRuleDisabled(rule) {
 			continue
 		}
-		logic, err = rule.optimize(logic)
+		logic, err = rule.optimize(ctx, logic)
 		if err != nil {
 			return nil, err
 		}
@@ -150,12 +154,17 @@ func logicalOptimize(flag uint64, logic LogicalPlan) (LogicalPlan, error) {
 	return logic, err
 }
 
-func physicalOptimize(logic LogicalPlan) (PhysicalPlan, error) {
+func isLogicalRuleDisabled(r logicalOptRule) bool {
+	disabled := DefaultDisabledLogicalRulesList.Load().(set.StringSet).Exist(r.name())
+	return disabled
+}
+
+func physicalOptimize(logic LogicalPlan) (PhysicalPlan, float64, error) {
 	if _, err := logic.recursiveDeriveStats(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	logic.preparePossibleProperties()
+	preparePossibleProperties(logic)
 
 	prop := &property.PhysicalProperty{
 		TaskTp:      property.RootTaskType,
@@ -164,14 +173,14 @@ func physicalOptimize(logic LogicalPlan) (PhysicalPlan, error) {
 
 	t, err := logic.findBestTask(prop)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if t.invalid() {
-		return nil, ErrInternal.GenWithStackByArgs("Can't find a proper physical plan for this query")
+		return nil, 0, ErrInternal.GenWithStackByArgs("Can't find a proper physical plan for this query")
 	}
 
 	err = t.plan().ResolveIndices()
-	return t.plan(), err
+	return t.plan(), t.cost(), err
 }
 
 func existsCartesianProduct(p LogicalPlan) bool {
@@ -186,6 +195,11 @@ func existsCartesianProduct(p LogicalPlan) bool {
 	return false
 }
 
+// DefaultDisabledLogicalRulesList indicates the logical rules which should be banned.
+var DefaultDisabledLogicalRulesList *atomic.Value
+
 func init() {
 	expression.EvalAstExpr = evalAstExpr
+	DefaultDisabledLogicalRulesList = new(atomic.Value)
+	DefaultDisabledLogicalRulesList.Store(set.NewStringSet())
 }

@@ -135,8 +135,8 @@ func makeMutRowColumn(in interface{}) *Column {
 		*(*types.MyDecimal)(unsafe.Pointer(&col.data[0])) = *x
 		return col
 	case types.Time:
-		col := newMutRowFixedLenColumn(16)
-		writeTime(col.data, x)
+		col := newMutRowFixedLenColumn(sizeTime)
+		*(*types.Time)(unsafe.Pointer(&col.data[0])) = x
 		return col
 	case json.BinaryJSON:
 		col := newMutRowVarLenColumn(len(x.Value) + 1)
@@ -195,7 +195,6 @@ func makeMutRowUint64Column(val uint64) *Column {
 func makeMutRowBytesColumn(bin []byte) *Column {
 	col := newMutRowVarLenColumn(len(bin))
 	copy(col.data, bin)
-	col.nullBitmap[0] = 1
 	return col
 }
 
@@ -203,7 +202,7 @@ func makeMutRowBytesColumn(bin []byte) *Column {
 func (mr MutRow) SetRow(row Row) {
 	for colIdx, rCol := range row.c.columns {
 		mrCol := mr.c.columns[colIdx]
-		if rCol.isNull(row.idx) {
+		if rCol.IsNull(row.idx) {
 			mrCol.nullBitmap[0] = 0
 			continue
 		}
@@ -253,7 +252,7 @@ func (mr MutRow) SetValue(colIdx int, val interface{}) {
 	case *types.MyDecimal:
 		*(*types.MyDecimal)(unsafe.Pointer(&col.data[0])) = *x
 	case types.Time:
-		writeTime(col.data, x)
+		*(*types.Time)(unsafe.Pointer(&col.data[0])) = x
 	case types.Enum:
 		setMutRowNameValue(col, x.Name, x.Value)
 	case types.Set:
@@ -286,7 +285,7 @@ func (mr MutRow) SetDatum(colIdx int, d types.Datum) {
 	case types.KindString, types.KindBytes, types.KindBinaryLiteral:
 		setMutRowBytes(col, d.GetBytes())
 	case types.KindMysqlTime:
-		writeTime(col.data, d.GetMysqlTime())
+		*(*types.Time)(unsafe.Pointer(&col.data[0])) = d.GetMysqlTime()
 	case types.KindMysqlDuration:
 		*(*int64)(unsafe.Pointer(&col.data[0])) = int64(d.GetMysqlDuration().Duration)
 	case types.KindMysqlDecimal:
@@ -351,7 +350,7 @@ func setMutRowJSON(col *Column, j json.BinaryJSON) {
 func (mr MutRow) ShallowCopyPartialRow(colIdx int, row Row) {
 	for i, srcCol := range row.c.columns {
 		dstCol := mr.c.columns[colIdx+i]
-		if !srcCol.isNull(row.idx) {
+		if !srcCol.IsNull(row.idx) {
 			// MutRow only contains one row, so we can directly set the whole byte.
 			dstCol.nullBitmap[0] = 1
 		} else {

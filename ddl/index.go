@@ -23,6 +23,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	ddlutil "github.com/pingcap/tidb/ddl/util"
@@ -30,6 +31,7 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
@@ -45,82 +47,33 @@ import (
 	"go.uber.org/zap"
 )
 
-const maxPrefixLength = 3072
-const maxCommentLength = 1024
+const (
+	maxPrefixLength = 3072
+	// MaxCommentLength is exported for testing.
+	MaxCommentLength = 1024
+)
 
-func buildIndexColumns(columns []*model.ColumnInfo, idxColNames []*ast.IndexColName) ([]*model.IndexColumn, error) {
+func buildIndexColumns(columns []*model.ColumnInfo, idxColNames []*ast.IndexPartSpecification) ([]*model.IndexColumn, error) {
 	// Build offsets.
 	idxColumns := make([]*model.IndexColumn, 0, len(idxColNames))
 
 	// The sum of length of all index columns.
 	sumLength := 0
-
 	for _, ic := range idxColNames {
-		col := model.FindColumnInfo(columns, ic.Column.Name.O)
+		col := model.FindColumnInfo(columns, ic.Column.Name.L)
 		if col == nil {
 			return nil, errKeyColumnDoesNotExits.GenWithStack("column does not exist: %s", ic.Column.Name)
 		}
 
-		if col.Flen == 0 && (types.IsTypeChar(col.FieldType.Tp) || types.IsTypeVarchar(col.FieldType.Tp)) {
-			return nil, errors.Trace(errWrongKeyColumn.GenWithStackByArgs(ic.Column.Name))
+		if err := checkIndexColumn(col, ic); err != nil {
+			return nil, err
 		}
 
-		// JSON column cannot index.
-		if col.FieldType.Tp == mysql.TypeJSON {
-			return nil, errors.Trace(errJSONUsedAsKey.GenWithStackByArgs(col.Name.O))
+		indexColumnLength, err := getIndexColumnLength(col, ic.Length)
+		if err != nil {
+			return nil, err
 		}
-
-		// Length must be specified for BLOB and TEXT column indexes.
-		if types.IsTypeBlob(col.FieldType.Tp) && ic.Length == types.UnspecifiedLength {
-			return nil, errors.Trace(errBlobKeyWithoutLength)
-		}
-
-		// Length can only be specified for specifiable types.
-		if ic.Length != types.UnspecifiedLength && !types.IsTypePrefixable(col.FieldType.Tp) {
-			return nil, errors.Trace(errIncorrectPrefixKey)
-		}
-
-		// Key length must be shorter or equal to the column length.
-		if ic.Length != types.UnspecifiedLength &&
-			types.IsTypeChar(col.FieldType.Tp) && col.Flen < ic.Length {
-			return nil, errors.Trace(errIncorrectPrefixKey)
-		}
-
-		// Specified length must be shorter than the max length for prefix.
-		if ic.Length > maxPrefixLength {
-			return nil, errors.Trace(errTooLongKey)
-		}
-
-		// Take care of the sum of length of all index columns.
-		if ic.Length != types.UnspecifiedLength {
-			sumLength += ic.Length
-		} else {
-			// Specified data types.
-			if col.Flen != types.UnspecifiedLength {
-				// Special case for the bit type.
-				if col.FieldType.Tp == mysql.TypeBit {
-					sumLength += (col.Flen + 7) >> 3
-				} else {
-					sumLength += col.Flen
-				}
-			} else {
-				if length, ok := mysql.DefaultLengthOfMysqlTypes[col.FieldType.Tp]; ok {
-					sumLength += length
-				} else {
-					return nil, errUnknownTypeLength.GenWithStackByArgs(col.FieldType.Tp)
-				}
-
-				// Special case for time fraction.
-				if types.IsTypeFractionable(col.FieldType.Tp) &&
-					col.FieldType.Decimal != types.UnspecifiedLength {
-					if length, ok := mysql.DefaultLengthOfTimeFraction[col.FieldType.Decimal]; ok {
-						sumLength += length
-					} else {
-						return nil, errUnknownFractionLength.GenWithStackByArgs(col.FieldType.Tp, col.FieldType.Decimal)
-					}
-				}
-			}
-		}
+		sumLength += indexColumnLength
 
 		// The sum of all lengths must be shorter than the max length for prefix.
 		if sumLength > maxPrefixLength {
@@ -137,7 +90,124 @@ func buildIndexColumns(columns []*model.ColumnInfo, idxColNames []*ast.IndexColN
 	return idxColumns, nil
 }
 
-func buildIndexInfo(tblInfo *model.TableInfo, indexName model.CIStr, idxColNames []*ast.IndexColName, state model.SchemaState) (*model.IndexInfo, error) {
+func checkPKOnGeneratedColumn(tblInfo *model.TableInfo, idxColNames []*ast.IndexPartSpecification) (*model.ColumnInfo, error) {
+	var lastCol *model.ColumnInfo
+	for _, colName := range idxColNames {
+		lastCol = getColumnInfoByName(tblInfo, colName.Column.Name.L)
+		if lastCol == nil {
+			return nil, errKeyColumnDoesNotExits.GenWithStackByArgs(colName.Column.Name)
+		}
+		// Virtual columns cannot be used in primary key.
+		if lastCol.IsGenerated() && !lastCol.GeneratedStored {
+			return nil, errUnsupportedOnGeneratedColumn.GenWithStackByArgs("Defining a virtual generated column as primary key")
+		}
+	}
+
+	return lastCol, nil
+}
+
+func checkIndexPrefixLength(columns []*model.ColumnInfo, idxColumns []*model.IndexColumn) error {
+	// The sum of length of all index columns.
+	sumLength := 0
+	for _, ic := range idxColumns {
+		col := model.FindColumnInfo(columns, ic.Name.L)
+		if col == nil {
+			return errKeyColumnDoesNotExits.GenWithStack("column does not exist: %s", ic.Name)
+		}
+
+		indexColumnLength, err := getIndexColumnLength(col, ic.Length)
+		if err != nil {
+			return err
+		}
+		sumLength += indexColumnLength
+		// The sum of all lengths must be shorter than the max length for prefix.
+		if sumLength > maxPrefixLength {
+			return errors.Trace(errTooLongKey)
+		}
+	}
+	return nil
+}
+
+func checkIndexColumn(col *model.ColumnInfo, ic *ast.IndexPartSpecification) error {
+	if col.Flen == 0 && (types.IsTypeChar(col.FieldType.Tp) || types.IsTypeVarchar(col.FieldType.Tp)) {
+		return errors.Trace(errWrongKeyColumn.GenWithStackByArgs(ic.Column.Name))
+	}
+
+	// JSON column cannot index.
+	if col.FieldType.Tp == mysql.TypeJSON {
+		return errors.Trace(errJSONUsedAsKey.GenWithStackByArgs(col.Name.O))
+	}
+
+	// Length must be specified for BLOB and TEXT column indexes.
+	if types.IsTypeBlob(col.FieldType.Tp) && ic.Length == types.UnspecifiedLength {
+		return errors.Trace(errBlobKeyWithoutLength)
+	}
+
+	// Length can only be specified for specifiable types.
+	if ic.Length != types.UnspecifiedLength && !types.IsTypePrefixable(col.FieldType.Tp) {
+		return errors.Trace(errIncorrectPrefixKey)
+	}
+
+	// Key length must be shorter or equal to the column length.
+	if ic.Length != types.UnspecifiedLength &&
+		types.IsTypeChar(col.FieldType.Tp) && col.Flen < ic.Length {
+		return errors.Trace(errIncorrectPrefixKey)
+	}
+
+	// Specified length must be shorter than the max length for prefix.
+	if ic.Length > maxPrefixLength {
+		return errors.Trace(errTooLongKey)
+	}
+	return nil
+}
+
+// getIndexColumnLength calculate the bytes number required in an index column.
+func getIndexColumnLength(col *model.ColumnInfo, colLen int) (int, error) {
+	length := types.UnspecifiedLength
+	if colLen != types.UnspecifiedLength {
+		length = colLen
+	} else if col.Flen != types.UnspecifiedLength {
+		length = col.Flen
+	}
+
+	switch col.Tp {
+	case mysql.TypeBit:
+		return (length + 7) >> 3, nil
+	case mysql.TypeVarchar, mysql.TypeString:
+		// Different charsets occupy different numbers of bytes on each character.
+		desc, err := charset.GetCharsetDesc(col.Charset)
+		if err != nil {
+			return 0, errUnsupportedCharset.GenWithStackByArgs(col.Charset, col.Collate)
+		}
+		return desc.Maxlen * length, nil
+	case mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeBlob, mysql.TypeLongBlob:
+		return length, nil
+	case mysql.TypeTiny, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong, mysql.TypeDouble, mysql.TypeShort:
+		return mysql.DefaultLengthOfMysqlTypes[col.Tp], nil
+	case mysql.TypeFloat:
+		if length <= mysql.MaxFloatPrecisionLength {
+			return mysql.DefaultLengthOfMysqlTypes[mysql.TypeFloat], nil
+		}
+		return mysql.DefaultLengthOfMysqlTypes[mysql.TypeDouble], nil
+	case mysql.TypeDecimal, mysql.TypeNewDecimal:
+		return calcBytesLengthForDecimal(length), nil
+	case mysql.TypeYear, mysql.TypeDate, mysql.TypeDuration, mysql.TypeDatetime, mysql.TypeTimestamp:
+		return mysql.DefaultLengthOfMysqlTypes[col.Tp], nil
+	default:
+		return length, nil
+	}
+}
+
+// Decimal using a binary format that packs nine decimal (base 10) digits into four bytes.
+func calcBytesLengthForDecimal(m int) int {
+	return (m / 9 * 4) + ((m%9)+1)/2
+}
+
+func buildIndexInfo(tblInfo *model.TableInfo, indexName model.CIStr, idxColNames []*ast.IndexPartSpecification, state model.SchemaState) (*model.IndexInfo, error) {
+	if err := checkTooLongIndex(indexName); err != nil {
+		return nil, errors.Trace(err)
+	}
+
 	idxColumns, err := buildIndexColumns(tblInfo.Columns, idxColNames)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -153,8 +223,14 @@ func buildIndexInfo(tblInfo *model.TableInfo, indexName model.CIStr, idxColNames
 }
 
 func addIndexColumnFlag(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) {
-	col := indexInfo.Columns[0]
+	if indexInfo.Primary {
+		for _, col := range indexInfo.Columns {
+			tblInfo.Columns[col.Offset].Flag |= mysql.PriKeyFlag
+		}
+		return
+	}
 
+	col := indexInfo.Columns[0]
 	if indexInfo.Unique && len(indexInfo.Columns) == 1 {
 		tblInfo.Columns[col.Offset].Flag |= mysql.UniqueKeyFlag
 	} else {
@@ -163,14 +239,17 @@ func addIndexColumnFlag(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) {
 }
 
 func dropIndexColumnFlag(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) {
-	col := indexInfo.Columns[0]
-
-	if indexInfo.Unique && len(indexInfo.Columns) == 1 {
-		tblInfo.Columns[col.Offset].Flag &= ^mysql.UniqueKeyFlag
+	if indexInfo.Primary {
+		for _, col := range indexInfo.Columns {
+			tblInfo.Columns[col.Offset].Flag &= ^mysql.PriKeyFlag
+		}
+	} else if indexInfo.Unique && len(indexInfo.Columns) == 1 {
+		tblInfo.Columns[indexInfo.Columns[0].Offset].Flag &= ^mysql.UniqueKeyFlag
 	} else {
-		tblInfo.Columns[col.Offset].Flag &= ^mysql.MultipleKeyFlag
+		tblInfo.Columns[indexInfo.Columns[0].Offset].Flag &= ^mysql.MultipleKeyFlag
 	}
 
+	col := indexInfo.Columns[0]
 	// other index may still cover this col
 	for _, index := range tblInfo.Indices {
 		if index.Name.L == indexInfo.Name.L {
@@ -218,7 +297,46 @@ func onRenameIndex(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	return ver, nil
 }
 
-func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, err error) {
+func getNullColInfos(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) ([]*model.ColumnInfo, error) {
+	nullCols := make([]*model.ColumnInfo, 0, len(indexInfo.Columns))
+	for _, colName := range indexInfo.Columns {
+		col := model.FindColumnInfo(tblInfo.Columns, colName.Name.L)
+		if !mysql.HasNotNullFlag(col.Flag) || mysql.HasPreventNullInsertFlag(col.Flag) {
+			nullCols = append(nullCols, col)
+		}
+	}
+	return nullCols, nil
+}
+
+func checkPrimaryKeyNotNull(w *worker, sqlMode mysql.SQLMode, t *meta.Meta, job *model.Job,
+	tblInfo *model.TableInfo, indexInfo *model.IndexInfo) (warnings []string, err error) {
+	if !indexInfo.Primary {
+		return nil, nil
+	}
+
+	dbInfo, err := t.GetDatabase(job.SchemaID)
+	if err != nil {
+		return nil, err
+	}
+	nullCols, err := getNullColInfos(tblInfo, indexInfo)
+	if err != nil {
+		return nil, err
+	}
+	if len(nullCols) == 0 {
+		return nil, nil
+	}
+
+	err = modifyColsFromNull2NotNull(w, dbInfo, tblInfo, nullCols, model.NewCIStr(""), false)
+	if err == nil {
+		return nil, nil
+	}
+	_, err = convertAddIdxJob2RollbackJob(t, job, tblInfo, indexInfo, err)
+	// TODO: Support non-strict mode.
+	// warnings = append(warnings, ErrWarnDataTruncated.GenWithStackByArgs(oldCol.Name.L, 0).Error())
+	return nil, err
+}
+
+func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job, isPK bool) (ver int64, err error) {
 	// Handle the rolling back job.
 	if job.IsRollingback() {
 		ver, err = onDropIndex(t, job)
@@ -238,10 +356,17 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int
 	var (
 		unique      bool
 		indexName   model.CIStr
-		idxColNames []*ast.IndexColName
+		idxColNames []*ast.IndexPartSpecification
 		indexOption *ast.IndexOption
+		sqlMode     mysql.SQLMode
+		warnings    []string
 	)
-	err = job.DecodeArgs(&unique, &indexName, &idxColNames, &indexOption)
+	if isPK {
+		// Notice: sqlMode and warnings is used to support non-strict mode.
+		err = job.DecodeArgs(&unique, &indexName, &idxColNames, &indexOption, &sqlMode, &warnings)
+	} else {
+		err = job.DecodeArgs(&unique, &indexName, &idxColNames, &indexOption)
+	}
 	if err != nil {
 		job.State = model.JobStateCancelled
 		return ver, errors.Trace(err)
@@ -250,7 +375,11 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int
 	indexInfo := tblInfo.FindIndexByName(indexName.L)
 	if indexInfo != nil && indexInfo.State == model.StatePublic {
 		job.State = model.JobStateCancelled
-		return ver, ErrDupKeyName.GenWithStack("index already exist %s", indexName)
+		err = ErrDupKeyName.GenWithStack("index already exist %s", indexName)
+		if isPK {
+			err = infoschema.ErrMultiplePriKey
+		}
+		return ver, err
 	}
 
 	if indexInfo == nil {
@@ -272,6 +401,13 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int
 			indexInfo.Tp = model.IndexTypeBtree
 		}
 		indexInfo.Primary = false
+		if isPK {
+			if _, err = checkPKOnGeneratedColumn(tblInfo, idxColNames); err != nil {
+				job.State = model.JobStateCancelled
+				return ver, err
+			}
+			indexInfo.Primary = true
+		}
 		indexInfo.Unique = unique
 		indexInfo.ID = allocateIndexID(tblInfo)
 		tblInfo.Indices = append(tblInfo.Indices, indexInfo)
@@ -288,24 +424,30 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int
 		// delete only -> write only
 		job.SchemaState = model.StateWriteOnly
 		indexInfo.State = model.StateWriteOnly
+		_, err = checkPrimaryKeyNotNull(w, sqlMode, t, job, tblInfo, indexInfo)
+		if err != nil {
+			break
+		}
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
 	case model.StateWriteOnly:
 		// write only -> reorganization
 		job.SchemaState = model.StateWriteReorganization
 		indexInfo.State = model.StateWriteReorganization
+		_, err = checkPrimaryKeyNotNull(w, sqlMode, t, job, tblInfo, indexInfo)
+		if err != nil {
+			break
+		}
 		// Initialize SnapshotVer to 0 for later reorganization check.
 		job.SnapshotVer = 0
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
 	case model.StateWriteReorganization:
 		// reorganization -> public
-		var tbl table.Table
-		tbl, err = getTable(d.store, schemaID, tblInfo)
+		tbl, err := getTable(d.store, schemaID, tblInfo)
 		if err != nil {
 			return ver, errors.Trace(err)
 		}
 
-		var reorgInfo *reorgInfo
-		reorgInfo, err = getReorgInfo(d, t, job, tbl)
+		reorgInfo, err := getReorgInfo(d, t, job, tbl)
 		if err != nil || reorgInfo.first {
 			// If we run reorg firstly, we should update the job snapshot version
 			// and then run the reorg next time.
@@ -343,6 +485,11 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int
 		indexInfo.State = model.StatePublic
 		// Set column index flag.
 		addIndexColumnFlag(tblInfo, indexInfo)
+		if isPK {
+			if err = updateColsNull2NotNull(tblInfo, indexInfo); err != nil {
+				return ver, errors.Trace(err)
+			}
+		}
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)
 		if err != nil {
 			return ver, errors.Trace(err)
@@ -350,7 +497,7 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int
 		// Finish this job.
 		job.FinishTableJob(model.JobStateDone, model.StatePublic, ver, tblInfo)
 	default:
-		err = ErrInvalidIndexState.GenWithStack("invalid index state %v", tblInfo.State)
+		err = ErrInvalidDDLState.GenWithStackByArgs("index", tblInfo.State)
 	}
 
 	return ver, errors.Trace(err)
@@ -407,7 +554,7 @@ func onDropIndex(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 			job.Args = append(job.Args, indexInfo.ID, getPartitionIDs(tblInfo))
 		}
 	default:
-		err = ErrInvalidIndexState.GenWithStack("invalid index state %v", indexInfo.State)
+		err = ErrInvalidDDLState.GenWithStackByArgs("index", indexInfo.State)
 	}
 	return ver, errors.Trace(err)
 }
@@ -430,7 +577,38 @@ func checkDropIndex(t *meta.Meta, job *model.Job) (*model.TableInfo, *model.Inde
 		job.State = model.JobStateCancelled
 		return nil, nil, ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)
 	}
+
+	// Double check for drop index on auto_increment column.
+	err = checkDropIndexOnAutoIncrementColumn(tblInfo, indexInfo)
+	if err != nil {
+		job.State = model.JobStateCancelled
+		return nil, nil, autoid.ErrWrongAutoKey
+	}
+
 	return tblInfo, indexInfo, nil
+}
+
+func checkDropIndexOnAutoIncrementColumn(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) error {
+	cols := tblInfo.Columns
+	for _, idxCol := range indexInfo.Columns {
+		if !mysql.HasAutoIncrementFlag(cols[idxCol.Offset].Flag) {
+			continue
+		}
+		// check the count of index on auto_increment column.
+		count := 0
+		for _, idx := range tblInfo.Indices {
+			for _, c := range idx.Columns {
+				if c.Name.L == idxCol.Name.L {
+					count++
+					break
+				}
+			}
+		}
+		if count < 2 {
+			return autoid.ErrWrongAutoKey
+		}
+	}
+	return nil
 }
 
 func checkRenameIndex(t *meta.Meta, job *model.Job) (*model.TableInfo, model.CIStr, model.CIStr, error) {
@@ -729,13 +907,13 @@ func (w *addIndexWorker) batchCheckUniqueKey(txn kv.Transaction, idxRecords []*i
 		w.distinctCheckFlags = append(w.distinctCheckFlags, distinct)
 	}
 
-	batchVals, err := txn.BatchGet(w.batchCheckKeys)
+	batchVals, err := txn.BatchGet(context.Background(), w.batchCheckKeys)
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	// 1. unique-key is duplicate and the handle is equal, skip it.
-	// 2. unique-key is duplicate and the handle is not equal, return duplicate error.
+	// 1. unique-key/primary-key is duplicate and the handle is equal, skip it.
+	// 2. unique-key/primary-key is duplicate and the handle is not equal, return duplicate error.
 	// 3. non-unique-key is duplicate, skip it.
 	for i, key := range w.batchCheckKeys {
 		if val, found := batchVals[string(key)]; found {
@@ -802,13 +980,13 @@ func (w *addIndexWorker) backfillIndexInTxn(handleRange reorgIndexTask) (taskCtx
 
 			// Lock the row key to notify us that someone delete or update the row,
 			// then we should not backfill the index of it, otherwise the adding index is redundant.
-			err := txn.LockKeys(context.Background(), 0, idxRecord.key)
+			err := txn.LockKeys(context.Background(), new(kv.LockCtx), idxRecord.key)
 			if err != nil {
 				return errors.Trace(err)
 			}
 
 			// Create the index.
-			handle, err := w.index.Create(w.sessCtx, txn, idxRecord.vals, idxRecord.handle, table.WithAssertion(txn))
+			handle, err := w.index.Create(w.sessCtx, txn, idxRecord.vals, idxRecord.handle)
 			if err != nil {
 				if kv.ErrKeyExists.Equal(err) && idxRecord.handle == handle {
 					// Index already exists, skip it.
@@ -826,6 +1004,8 @@ func (w *addIndexWorker) backfillIndexInTxn(handleRange reorgIndexTask) (taskCtx
 
 	return
 }
+
+var addIndexSpeedCounter = metrics.AddIndexTotalCounter.WithLabelValues("speed")
 
 // handleBackfillTask backfills range [task.startHandle, task.endHandle) handle's index to table.
 func (w *addIndexWorker) handleBackfillTask(d *ddlCtx, task *reorgIndexTask) *addIndexResult {
@@ -852,6 +1032,7 @@ func (w *addIndexWorker) handleBackfillTask(d *ddlCtx, task *reorgIndexTask) *ad
 			return result
 		}
 
+		addIndexSpeedCounter.Add(float64(taskCtx.addedCount))
 		mergeAddIndexCtxToResult(&taskCtx, result)
 		w.ddlWorker.reorgCtx.increaseRowCount(int64(taskCtx.addedCount))
 
@@ -908,27 +1089,23 @@ func (w *addIndexWorker) run(d *ddlCtx) {
 
 func makeupDecodeColMap(sessCtx sessionctx.Context, t table.Table, indexInfo *model.IndexInfo) (map[int64]decoder.Column, error) {
 	cols := t.Cols()
-	decodeColMap := make(map[int64]decoder.Column, len(indexInfo.Columns))
-	for _, v := range indexInfo.Columns {
-		col := cols[v.Offset]
-		tpExpr := decoder.Column{
-			Col: col,
-		}
-		if col.IsGenerated() && !col.GeneratedStored {
-			for _, c := range cols {
-				if _, ok := col.Dependences[c.Name.L]; ok {
-					decodeColMap[c.ID] = decoder.Column{
-						Col: c,
-					}
-				}
-			}
-			e, err := expression.ParseSimpleExprCastWithTableInfo(sessCtx, col.GeneratedExprString, t.Meta(), &col.FieldType)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			tpExpr.GenExpr = e
-		}
-		decodeColMap[col.ID] = tpExpr
+	indexedCols := make([]*table.Column, len(indexInfo.Columns))
+	for i, v := range indexInfo.Columns {
+		indexedCols[i] = cols[v.Offset]
+	}
+
+	var containsVirtualCol bool
+	decodeColMap, err := decoder.BuildFullDecodeColMap(indexedCols, t, func(genCol *table.Column) (expression.Expression, error) {
+		containsVirtualCol = true
+		return expression.ParseSimpleExprCastWithTableInfo(sessCtx, genCol.GeneratedExprString, t.Meta(), &genCol.FieldType)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if containsVirtualCol {
+		decoder.SubstituteGenColsInDecodeColMap(decodeColMap)
+		decoder.RemoveUnusedVirtualCols(decodeColMap, indexedCols)
 	}
 	return decodeColMap, nil
 }
@@ -995,7 +1172,8 @@ func (w *worker) waitTaskResults(workers []*addIndexWorker, taskCnt int, totalAd
 		}
 
 		if result.err != nil {
-			logutil.BgLogger().Warn("[ddl] add index worker return error", zap.Int("workerID", worker.id), zap.Error(result.err))
+			logutil.BgLogger().Warn("[ddl] add index worker failed", zap.Int("workerID", worker.id),
+				zap.Error(result.err))
 		}
 
 		if firstErr == nil {
@@ -1184,7 +1362,8 @@ func (w *worker) addPhysicalTableIndex(t table.PhysicalTable, indexInfo *model.I
 			}
 		})
 
-		logutil.BgLogger().Info("[ddl] start add index workers to reorg index", zap.Int("workerCnt", len(idxWorkers)), zap.Int("regionCnt", len(kvRanges)), zap.Int64("startHandle", startHandle), zap.Int64("endHandle", endHandle))
+		logutil.BgLogger().Info("[ddl] start add index workers to reorg index", zap.Int("workerCnt", len(idxWorkers)),
+			zap.Int("regionCnt", len(kvRanges)), zap.Int64("startHandle", startHandle), zap.Int64("endHandle", endHandle))
 		remains, err := w.sendRangeTaskToWorkers(t, idxWorkers, reorgInfo, &totalAddedCount, kvRanges)
 		if err != nil {
 			return errors.Trace(err)
@@ -1286,7 +1465,7 @@ func iterateSnapshotRows(store kv.Storage, priority int, t table.Table, version 
 	ver := kv.Version{Ver: version}
 
 	snap, err := store.GetSnapshot(ver)
-	snap.SetPriority(priority)
+	snap.SetOption(kv.Priority, priority)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1338,4 +1517,31 @@ func iterateSnapshotRows(store kv.Storage, priority int, t table.Table, version 
 	}
 
 	return nil
+}
+
+func getIndexInfoByNameAndColumn(oldTableInfo *model.TableInfo, newOne *model.IndexInfo) *model.IndexInfo {
+	for _, oldOne := range oldTableInfo.Indices {
+		if newOne.Name.L == oldOne.Name.L && indexColumnSliceEqual(newOne.Columns, oldOne.Columns) {
+			return oldOne
+		}
+	}
+	return nil
+}
+
+func indexColumnSliceEqual(a, b []*model.IndexColumn) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		logutil.BgLogger().Warn("[ddl] admin repair table : index's columns length equal to 0")
+		return true
+	}
+	// Accelerate the compare by eliminate index bound check.
+	b = b[:len(a)]
+	for i, v := range a {
+		if v.Name.L != b[i].Name.L {
+			return false
+		}
+	}
+	return true
 }

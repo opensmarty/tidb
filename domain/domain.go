@@ -21,17 +21,18 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/coreos/etcd/clientv3"
 	"github.com/ngaut/pools"
 	"github.com/ngaut/sync2"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/bindinfo"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/domain/infosync"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/infoschema/perfschema"
 	"github.com/pingcap/tidb/kv"
@@ -44,9 +45,11 @@ import (
 	"github.com/pingcap/tidb/statistics/handle"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/domainutil"
 	"github.com/pingcap/tidb/util/expensivequery"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sqlexec"
+	"go.etcd.io/etcd/clientv3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -61,18 +64,18 @@ type Domain struct {
 	bindHandle           *bindinfo.BindHandle
 	statsHandle          unsafe.Pointer
 	statsLease           time.Duration
-	statsUpdating        sync2.AtomicInt32
 	ddl                  ddl.DDL
-	info                 *InfoSyncer
+	info                 *infosync.InfoSyncer
 	m                    sync.Mutex
 	SchemaValidator      SchemaValidator
 	sysSessionPool       *sessionPool
 	exit                 chan struct{}
 	etcdClient           *clientv3.Client
-	wg                   sync.WaitGroup
 	gvc                  GlobalVariableCache
 	slowQuery            *topNSlowQueries
 	expensiveQueryHandle *expensivequery.Handle
+	wg                   sync.WaitGroup
+	statsUpdating        sync2.AtomicInt32
 }
 
 // loadInfoSchema loads infoschema at startTS into handle, usedSchemaVersion is the currently used
@@ -205,6 +208,10 @@ func (do *Domain) fetchSchemasWithTables(schemas []*model.DBInfo, m *meta.Meta, 
 				continue
 			}
 			infoschema.ConvertCharsetCollateToLowerCaseIfNeed(tbl)
+			// Check whether the table is in repair mode.
+			if domainutil.RepairInfo.InRepairMode() && domainutil.RepairInfo.CheckAndFetchRepairedTable(di, tbl) {
+				continue
+			}
 			di.Tables = append(di.Tables, tbl)
 		}
 	}
@@ -253,10 +260,21 @@ func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64
 		if err != nil {
 			return false, nil, err
 		}
+		if canSkipSchemaCheckerDDL(diff.Type) {
+			continue
+		}
 		tblIDs = append(tblIDs, ids...)
 	}
 	builder.Build()
 	return true, tblIDs, nil
+}
+
+func canSkipSchemaCheckerDDL(tp model.ActionType) bool {
+	switch tp {
+	case model.ActionUpdateTiFlashReplicaStatus, model.ActionSetTiFlashReplica:
+		return true
+	}
+	return false
 }
 
 // InfoSchema gets information schema from domain.
@@ -290,7 +308,7 @@ func (do *Domain) DDL() ddl.DDL {
 }
 
 // InfoSyncer gets infoSyncer from domain.
-func (do *Domain) InfoSyncer() *InfoSyncer {
+func (do *Domain) InfoSyncer() *infosync.InfoSyncer {
 	return do.info
 }
 
@@ -420,8 +438,12 @@ func (do *Domain) topNSlowQueryLoop() {
 func (do *Domain) infoSyncerKeeper() {
 	defer do.wg.Done()
 	defer recoverInDomain("infoSyncerKeeper", false)
+	ticker := time.NewTicker(infosync.ReportInterval)
+	defer ticker.Stop()
 	for {
 		select {
+		case <-ticker.C:
+			do.info.ReportMinStartTS(do.Store())
 		case <-do.info.Done():
 			logutil.BgLogger().Info("server info syncer need to restart")
 			if err := do.info.Restart(context.Background()); err != nil {
@@ -547,6 +569,7 @@ func (do *Domain) Close() {
 	}
 	if do.info != nil {
 		do.info.RemoveServerInfo()
+		do.info.RemoveMinStartTS()
 	}
 	close(do.exit)
 	if do.etcdClient != nil {
@@ -633,7 +656,15 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 	ctx := context.Background()
 	callback := &ddlCallback{do: do}
 	d := do.ddl
-	do.ddl = ddl.NewDDL(ctx, do.etcdClient, do.store, do.infoHandle, callback, ddlLease, sysCtxPool)
+	do.ddl = ddl.NewDDL(
+		ctx,
+		ddl.WithEtcdClient(do.etcdClient),
+		ddl.WithStore(do.store),
+		ddl.WithInfoHandle(do.infoHandle),
+		ddl.WithHook(callback),
+		ddl.WithLease(ddlLease),
+		ddl.WithResourcePool(sysCtxPool),
+	)
 	failpoint.Inject("MockReplaceDDL", func(val failpoint.Value) {
 		if val.(bool) {
 			if err := do.ddl.Stop(); err != nil {
@@ -647,8 +678,7 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 	if err != nil {
 		return err
 	}
-	do.info = NewInfoSyncer(do.ddl.GetID(), do.etcdClient)
-	err = do.info.Init(ctx)
+	do.info, err = infosync.GlobalInfoSyncerInit(ctx, do.ddl.GetID(), do.etcdClient)
 	if err != nil {
 		return err
 	}
@@ -785,8 +815,6 @@ func (do *Domain) LoadPrivilegeLoop(ctx sessionctx.Context) error {
 			metrics.LoadPrivilegeCounter.WithLabelValues(metrics.RetLabel(err)).Inc()
 			if err != nil {
 				logutil.BgLogger().Error("load privilege failed", zap.Error(err))
-			} else {
-				logutil.BgLogger().Debug("reload privilege success")
 			}
 		}
 	}()
@@ -805,50 +833,65 @@ func (do *Domain) BindHandle() *bindinfo.BindHandle {
 
 // LoadBindInfoLoop create a goroutine loads BindInfo in a loop, it should
 // be called only once in BootstrapSession.
-func (do *Domain) LoadBindInfoLoop(ctx sessionctx.Context) error {
-	ctx.GetSessionVars().InRestrictedSQL = true
-	do.bindHandle = bindinfo.NewBindHandle(ctx)
+func (do *Domain) LoadBindInfoLoop(ctxForHandle sessionctx.Context, ctxForEvolve sessionctx.Context) error {
+	ctxForHandle.GetSessionVars().InRestrictedSQL = true
+	ctxForEvolve.GetSessionVars().InRestrictedSQL = true
+	do.bindHandle = bindinfo.NewBindHandle(ctxForHandle)
 	err := do.bindHandle.Update(true)
 	if err != nil || bindinfo.Lease == 0 {
 		return err
 	}
 
-	do.loadBindInfoLoop()
-	do.handleInvalidBindTaskLoop()
+	do.globalBindHandleWorkerLoop()
+	do.handleEvolvePlanTasksLoop(ctxForEvolve)
 	return nil
 }
 
-func (do *Domain) loadBindInfoLoop() {
+func (do *Domain) globalBindHandleWorkerLoop() {
 	do.wg.Add(1)
 	go func() {
 		defer do.wg.Done()
-		defer recoverInDomain("loadBindInfoLoop", false)
+		defer recoverInDomain("globalBindHandleWorkerLoop", false)
+		bindWorkerTicker := time.NewTicker(bindinfo.Lease)
+		defer bindWorkerTicker.Stop()
 		for {
 			select {
 			case <-do.exit:
 				return
-			case <-time.After(bindinfo.Lease):
-			}
-			err := do.bindHandle.Update(false)
-			if err != nil {
-				logutil.BgLogger().Error("update bindinfo failed", zap.Error(err))
+			case <-bindWorkerTicker.C:
+				err := do.bindHandle.Update(false)
+				if err != nil {
+					logutil.BgLogger().Error("update bindinfo failed", zap.Error(err))
+				}
+				if !variable.TiDBOptOn(variable.CapturePlanBaseline.GetVal()) {
+					continue
+				}
+				do.bindHandle.DropInvalidBindRecord()
+				do.bindHandle.CaptureBaselines()
+				do.bindHandle.SaveEvolveTasksToStore()
 			}
 		}
 	}()
 }
 
-func (do *Domain) handleInvalidBindTaskLoop() {
+func (do *Domain) handleEvolvePlanTasksLoop(ctx sessionctx.Context) {
 	do.wg.Add(1)
 	go func() {
 		defer do.wg.Done()
-		defer recoverInDomain("loadBindInfoLoop-dropInvalidBindInfo", false)
+		defer recoverInDomain("handleEvolvePlanTasksLoop", false)
+		owner := do.newOwnerManager(bindinfo.Prompt, bindinfo.OwnerKey)
 		for {
 			select {
 			case <-do.exit:
 				return
 			case <-time.After(bindinfo.Lease):
 			}
-			do.bindHandle.DropInvalidBindRecord()
+			if owner.IsOwner() {
+				err := do.bindHandle.HandleEvolvePlanTask(ctx)
+				if err != nil {
+					logutil.BgLogger().Info("evolve plan failed", zap.Error(err))
+				}
+			}
 		}
 	}()
 }
@@ -896,7 +939,7 @@ func (do *Domain) UpdateTableStatsLoop(ctx sessionctx.Context) error {
 	if do.statsLease <= 0 {
 		return nil
 	}
-	owner := do.newStatsOwner()
+	owner := do.newOwnerManager(handle.StatsPrompt, handle.StatsOwnerKey)
 	do.wg.Add(1)
 	do.SetStatsUpdating(true)
 	go do.updateStatsWorker(ctx, owner)
@@ -907,14 +950,14 @@ func (do *Domain) UpdateTableStatsLoop(ctx sessionctx.Context) error {
 	return nil
 }
 
-func (do *Domain) newStatsOwner() owner.Manager {
+func (do *Domain) newOwnerManager(prompt, ownerKey string) owner.Manager {
 	id := do.ddl.OwnerManager().ID()
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 	var statsOwner owner.Manager
 	if do.etcdClient == nil {
 		statsOwner = owner.NewMockManager(id, cancelFunc)
 	} else {
-		statsOwner = owner.NewOwnerManager(do.etcdClient, handle.StatsPrompt, id, handle.StatsOwnerKey, cancelFunc)
+		statsOwner = owner.NewOwnerManager(do.etcdClient, prompt, id, ownerKey, cancelFunc)
 	}
 	// TODO: Need to do something when err is not nil.
 	err := statsOwner.CampaignOwner(cancelCtx)
@@ -1060,7 +1103,7 @@ func (do *Domain) NotifyUpdatePrivilege(ctx sessionctx.Context) {
 		}
 	}
 	// update locally
-	_, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, `FLUSH PRIVILEGES`)
+	_, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(`FLUSH PRIVILEGES`)
 	if err != nil {
 		logutil.BgLogger().Error("unable to update privileges", zap.Error(err))
 	}
@@ -1082,21 +1125,19 @@ func recoverInDomain(funcName string, quit bool) {
 	}
 }
 
-// Domain error codes.
-const (
-	codeInfoSchemaExpired terror.ErrCode = 1
-	codeInfoSchemaChanged terror.ErrCode = 2
-)
-
 var (
 	// ErrInfoSchemaExpired returns the error that information schema is out of date.
-	ErrInfoSchemaExpired = terror.ClassDomain.New(codeInfoSchemaExpired, "Information schema is out of date.")
+	ErrInfoSchemaExpired = terror.ClassDomain.New(mysql.ErrInfoSchemaExpired, mysql.MySQLErrName[mysql.ErrInfoSchemaExpired])
 	// ErrInfoSchemaChanged returns the error that information schema is changed.
-	ErrInfoSchemaChanged = terror.ClassDomain.New(codeInfoSchemaChanged,
-		"Information schema is changed. "+kv.TxnRetryableMark)
+	ErrInfoSchemaChanged = terror.ClassDomain.New(mysql.ErrInfoSchemaChanged,
+		mysql.MySQLErrName[mysql.ErrInfoSchemaChanged]+". "+kv.TxnRetryableMark)
 )
 
 func init() {
 	// Map error codes to mysql error codes.
-	terror.ErrClassToMySQLCodes[terror.ClassDomain] = make(map[terror.ErrCode]uint16)
+	domainMySQLErrCodes := map[terror.ErrCode]uint16{
+		mysql.ErrInfoSchemaExpired: mysql.ErrInfoSchemaExpired,
+		mysql.ErrInfoSchemaChanged: mysql.ErrInfoSchemaChanged,
+	}
+	terror.ErrClassToMySQLCodes[terror.ClassDomain] = domainMySQLErrCodes
 }

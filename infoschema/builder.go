@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
+	"github.com/pingcap/tidb/util/domainutil"
 )
 
 // Builder builds a new InfoSchema.
@@ -46,7 +48,6 @@ func (b *Builder) ApplyDiff(m *meta.Meta, diff *model.SchemaDiff) ([]int64, erro
 	} else if diff.Type == model.ActionModifySchemaCharsetAndCollate {
 		return nil, b.applyModifySchemaCharsetAndCollate(m, diff)
 	}
-
 	roDBInfo, ok := b.is.SchemaByID(diff.SchemaID)
 	if !ok {
 		return nil, ErrDatabaseNotExists.GenWithStackByArgs(
@@ -56,7 +57,7 @@ func (b *Builder) ApplyDiff(m *meta.Meta, diff *model.SchemaDiff) ([]int64, erro
 	var oldTableID, newTableID int64
 	tblIDs := make([]int64, 0, 2)
 	switch diff.Type {
-	case model.ActionCreateTable, model.ActionRecoverTable:
+	case model.ActionCreateTable, model.ActionRecoverTable, model.ActionRepairTable:
 		newTableID = diff.TableID
 		tblIDs = append(tblIDs, newTableID)
 	case model.ActionDropTable, model.ActionDropView:
@@ -95,7 +96,7 @@ func (b *Builder) ApplyDiff(m *meta.Meta, diff *model.SchemaDiff) ([]int64, erro
 	}
 	if tableIDIsValid(newTableID) {
 		// All types except DropTableOrView.
-		err := b.applyCreateTable(m, dbInfo, newTableID, alloc)
+		err := b.applyCreateTable(m, dbInfo, newTableID, alloc, diff.Type)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -154,22 +155,22 @@ func (b *Builder) applyDropSchema(schemaID int64) []int64 {
 	delete(b.is.schemaMap, di.Name.L)
 
 	// Copy the sortedTables that contain the table we are going to drop.
+	tableIDs := make([]int64, 0, len(di.Tables))
 	bucketIdxMap := make(map[int]struct{})
 	for _, tbl := range di.Tables {
 		bucketIdxMap[tableBucketIdx(tbl.ID)] = struct{}{}
+		// TODO: If the table ID doesn't exist.
+		tableIDs = append(tableIDs, tbl.ID)
 	}
 	for bucketIdx := range bucketIdxMap {
 		b.copySortedTablesBucket(bucketIdx)
 	}
 
-	ids := make([]int64, 0, len(di.Tables))
 	di = di.Clone()
-	for _, tbl := range di.Tables {
-		b.applyDropTable(di, tbl.ID)
-		// TODO: If the table ID doesn't exist.
-		ids = append(ids, tbl.ID)
+	for _, id := range tableIDs {
+		b.applyDropTable(di, id)
 	}
-	return ids
+	return tableIDs
 }
 
 func (b *Builder) copySortedTablesBucket(bucketIdx int) {
@@ -179,7 +180,7 @@ func (b *Builder) copySortedTablesBucket(bucketIdx int) {
 	b.is.sortedTablesBuckets[bucketIdx] = newSortedTables
 }
 
-func (b *Builder) applyCreateTable(m *meta.Meta, dbInfo *model.DBInfo, tableID int64, alloc autoid.Allocator) error {
+func (b *Builder) applyCreateTable(m *meta.Meta, dbInfo *model.DBInfo, tableID int64, alloc autoid.Allocator, tp model.ActionType) error {
 	tblInfo, err := m.GetTable(dbInfo.ID, tableID)
 	if err != nil {
 		return errors.Trace(err)
@@ -192,6 +193,16 @@ func (b *Builder) applyCreateTable(m *meta.Meta, dbInfo *model.DBInfo, tableID i
 			fmt.Sprintf("(Table ID %d)", tableID),
 		)
 	}
+	// Failpoint check whether tableInfo should be added to repairInfo.
+	// Typically used in repair table test to load mock `bad` tableInfo into repairInfo.
+	failpoint.Inject("repairFetchCreateTable", func(val failpoint.Value) {
+		if val.(bool) {
+			if domainutil.RepairInfo.InRepairMode() && tp != model.ActionRepairTable && domainutil.RepairInfo.CheckAndFetchRepairedTable(dbInfo, tblInfo) {
+				failpoint.Return(nil)
+			}
+		}
+	})
+
 	ConvertCharsetCollateToLowerCaseIfNeed(tblInfo)
 	ConvertOldVersionUTF8ToUTF8MB4IfNeed(tblInfo)
 
@@ -323,8 +334,8 @@ func (b *Builder) InitWithDBInfos(dbInfos []*model.DBInfo, schemaVersion int64) 
 			return nil, errors.Trace(err)
 		}
 	}
-	// TODO: Update INFORMATION_SCHEMA schema to use virtual table.
-	b.createSchemaTablesForInfoSchemaDB()
+
+	// Sort all tables by `ID`
 	for _, v := range info.sortedTablesBuckets {
 		sort.Sort(v)
 	}
@@ -364,20 +375,6 @@ var drivers []*virtualTableDriver
 // RegisterVirtualTable register virtual tables to the builder.
 func RegisterVirtualTable(dbInfo *model.DBInfo, tableFromMeta tableFromMetaFunc) {
 	drivers = append(drivers, &virtualTableDriver{dbInfo, tableFromMeta})
-}
-
-func (b *Builder) createSchemaTablesForInfoSchemaDB() {
-	infoSchemaSchemaTables := &schemaTables{
-		dbInfo: infoSchemaDB,
-		tables: make(map[string]table.Table, len(infoSchemaDB.Tables)),
-	}
-	b.is.schemaMap[infoSchemaDB.Name.L] = infoSchemaSchemaTables
-	for _, t := range infoSchemaDB.Tables {
-		tbl := createInfoSchemaTable(b.handle, t)
-		infoSchemaSchemaTables.tables[t.Name.L] = tbl
-		bucketIdx := tableBucketIdx(t.ID)
-		b.is.sortedTablesBuckets[bucketIdx] = append(b.is.sortedTablesBuckets[bucketIdx], tbl)
-	}
 }
 
 // Build sets new InfoSchema to the handle in the Builder.

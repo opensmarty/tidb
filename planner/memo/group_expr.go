@@ -16,6 +16,7 @@ package memo
 import (
 	"fmt"
 
+	"github.com/pingcap/tidb/expression"
 	plannercore "github.com/pingcap/tidb/planner/core"
 )
 
@@ -28,6 +29,7 @@ type GroupExpr struct {
 	ExprNode plannercore.LogicalPlan
 	Children []*Group
 	Explored bool
+	Group    *Group
 
 	selfFingerprint string
 }
@@ -50,4 +52,14 @@ func (e *GroupExpr) FingerPrint() string {
 		}
 	}
 	return e.selfFingerprint
+}
+
+// SetChildren sets Children of the GroupExpr.
+func (e *GroupExpr) SetChildren(children ...*Group) {
+	e.Children = children
+}
+
+// Schema gets GroupExpr's Schema.
+func (e *GroupExpr) Schema() *expression.Schema {
+	return e.Group.Prop.Schema
 }

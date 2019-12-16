@@ -17,20 +17,20 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	zaplog "github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
@@ -40,6 +40,7 @@ import (
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/helper"
@@ -204,13 +205,28 @@ func regionContainsTable(c *C, regionID uint64, tableID int64) bool {
 	return false
 }
 
-func (ts *HTTPHandlerTestSuite) TestListTableRegionsWithError(c *C) {
+func (ts *HTTPHandlerTestSuite) TestListTableRegions(c *C) {
 	ts.startServer(c)
 	defer ts.stopServer(c)
+	ts.prepareData(c)
+	// Test list table regions with error
 	resp, err := http.Get("http://127.0.0.1:10090/tables/fdsfds/aaa/regions")
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
 	c.Assert(resp.StatusCode, Equals, http.StatusBadRequest)
+
+	resp, err = http.Get("http://127.0.0.1:10090/tables/tidb/pt/regions")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+
+	var data []*TableRegions
+	dec := json.NewDecoder(resp.Body)
+	err = dec.Decode(&data)
+	c.Assert(err, IsNil)
+
+	region := data[1]
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/regions/%d", region.TableID))
+	c.Assert(err, IsNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestGetRegionByIDWithError(c *C) {
@@ -220,6 +236,73 @@ func (ts *HTTPHandlerTestSuite) TestGetRegionByIDWithError(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(resp.StatusCode, Equals, http.StatusBadRequest)
 	defer resp.Body.Close()
+}
+
+func (ts *HTTPHandlerTestSuite) TestBinlogRecover(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	binloginfo.EnableSkipBinlogFlag()
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, true)
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, false)
+
+	// Invalid operation will use the default operation.
+	binloginfo.EnableSkipBinlogFlag()
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, true)
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=abc"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, false)
+
+	binloginfo.EnableSkipBinlogFlag()
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, true)
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=abc&seconds=1"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, false)
+
+	binloginfo.EnableSkipBinlogFlag()
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, true)
+	binloginfo.AddOneSkippedCommitter()
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=abc&seconds=1"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusBadRequest)
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, false)
+	binloginfo.RemoveOneSkippedCommitter()
+
+	binloginfo.AddOneSkippedCommitter()
+	c.Assert(binloginfo.SkippedCommitterCount(), Equals, int32(1))
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=reset"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(binloginfo.SkippedCommitterCount(), Equals, int32(0))
+
+	binloginfo.EnableSkipBinlogFlag()
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=nowait"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, false)
+
+	// Only the first should work.
+	binloginfo.EnableSkipBinlogFlag()
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=nowait&op=reset"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(binloginfo.IsBinlogSkipped(), Equals, false)
+
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/binlog/recover?op=status"))
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
 }
 
 func (ts *HTTPHandlerTestSuite) TestRegionsFromMeta(c *C) {
@@ -305,18 +388,25 @@ func (ts *HTTPHandlerTestSuite) prepareData(c *C) {
 	c.Assert(err, IsNil)
 	dbt.mustExec("alter table tidb.test add index idx1 (a, b);")
 	dbt.mustExec("alter table tidb.test add unique index idx2 (a, b);")
+
+	dbt.mustExec(`create table tidb.pt (a int) partition by range (a)
+(partition p0 values less than (256),
+ partition p1 values less than (512),
+ partition p2 values less than (1024))`)
 }
 
 func decodeKeyMvcc(closer io.ReadCloser, c *C, valid bool) {
 	decoder := json.NewDecoder(closer)
-	var data kvrpcpb.MvccGetByKeyResponse
+	var data mvccKV
 	err := decoder.Decode(&data)
 	c.Assert(err, IsNil)
 	if valid {
-		c.Assert(data.Info, NotNil)
-		c.Assert(len(data.Info.Writes), Greater, 0)
+		c.Assert(data.Value.Info, NotNil)
+		c.Assert(len(data.Value.Info.Writes), Greater, 0)
 	} else {
-		c.Assert(data.Info, IsNil)
+		c.Assert(data.Value.Info.Lock, IsNil)
+		c.Assert(data.Value.Info.Writes, IsNil)
+		c.Assert(data.Value.Info.Values, IsNil)
 	}
 }
 
@@ -325,48 +415,49 @@ func (ts *HTTPHandlerTestSuite) TestGetTableMVCC(c *C) {
 	ts.prepareData(c)
 	defer ts.stopServer(c)
 
-	c.Skip("MVCCLevelDB doesn't implement MVCCDebugger interface.")
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/key/tidb/test/1"))
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
-	var data kvrpcpb.MvccGetByKeyResponse
+	var data mvccKV
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
-	c.Assert(data.Info, NotNil)
-	c.Assert(len(data.Info.Writes), Greater, 0)
-	startTs := data.Info.Writes[0].StartTs
-
-	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/txn/%d", startTs))
-	c.Assert(err, IsNil)
-	var p1 kvrpcpb.MvccGetByStartTsResponse
-	decoder = json.NewDecoder(resp.Body)
-	err = decoder.Decode(&p1)
-	c.Assert(err, IsNil)
+	c.Assert(data.Value, NotNil)
+	info := data.Value.Info
+	c.Assert(info, NotNil)
+	c.Assert(len(info.Writes), Greater, 0)
+	startTs := info.Writes[0].StartTs
 
 	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/txn/%d/tidb/test", startTs))
 	c.Assert(err, IsNil)
-	var p2 kvrpcpb.MvccGetByStartTsResponse
+	var p2 mvccKV
 	decoder = json.NewDecoder(resp.Body)
 	err = decoder.Decode(&p2)
 	c.Assert(err, IsNil)
 
-	for id, expect := range data.Info.Values {
-		v1 := p1.Info.Values[id].Value
-		v2 := p2.Info.Values[id].Value
-		c.Assert(bytes.Equal(v1, expect.Value), IsTrue)
-		c.Assert(bytes.Equal(v2, expect.Value), IsTrue)
+	for i, expect := range info.Values {
+		v2 := p2.Value.Info.Values[i].Value
+		c.Assert(v2, BytesEquals, expect.Value)
 	}
 
-	_, key, err := codec.DecodeBytes(p1.Key, nil)
-	c.Assert(err, IsNil)
-	hexKey := hex.EncodeToString(key)
+	hexKey := p2.Key
 	resp, err = http.Get("http://127.0.0.1:10090/mvcc/hex/" + hexKey)
 	c.Assert(err, IsNil)
 	decoder = json.NewDecoder(resp.Body)
-	var data2 kvrpcpb.MvccGetByKeyResponse
+	var data2 mvccKV
 	err = decoder.Decode(&data2)
 	c.Assert(err, IsNil)
 	c.Assert(data2, DeepEquals, data)
+
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/key/tidb/test/1?decode=true"))
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	var data3 map[string]interface{}
+	err = decoder.Decode(&data3)
+	c.Assert(err, IsNil)
+	c.Assert(data3["key"], NotNil)
+	c.Assert(data3["info"], NotNil)
+	c.Assert(data3["data"], NotNil)
+	c.Assert(data3["decode_error"], IsNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestGetMVCCNotFound(c *C) {
@@ -376,19 +467,82 @@ func (ts *HTTPHandlerTestSuite) TestGetMVCCNotFound(c *C) {
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/key/tidb/test/1234"))
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
-	var data kvrpcpb.MvccGetByKeyResponse
+	var data mvccKV
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
-	c.Assert(data.Info, IsNil)
+	c.Assert(data.Value.Info.Lock, IsNil)
+	c.Assert(data.Value.Info.Writes, IsNil)
+	c.Assert(data.Value.Info.Values, IsNil)
+}
 
-	c.Skip("MVCCLevelDB doesn't implement MVCCDebugger interface.")
-	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/mvcc/txn/0"))
+func (ts *HTTPHandlerTestSuite) TestTiFlashReplica(c *C) {
+	ts.startServer(c)
+	ts.prepareData(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/tiflash/replica")
 	c.Assert(err, IsNil)
-	var p kvrpcpb.MvccGetByStartTsResponse
+	decoder := json.NewDecoder(resp.Body)
+	var data []tableFlashReplicaInfo
+	err = decoder.Decode(&data)
+	c.Assert(err, IsNil)
+	c.Assert(len(data), Equals, 0)
+
+	db, err := sql.Open("mysql", getDSN())
+	c.Assert(err, IsNil, Commentf("Error connecting"))
+	defer db.Close()
+	dbt := &DBTest{c, db}
+
+	dbt.mustExec("use tidb")
+	dbt.mustExec("alter table test set tiflash replica 2 location labels 'a','b';")
+
+	resp, err = http.Get("http://127.0.0.1:10090/tiflash/replica")
+	c.Assert(err, IsNil)
 	decoder = json.NewDecoder(resp.Body)
-	err = decoder.Decode(&p)
+	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
-	c.Assert(p.Info, IsNil)
+	c.Assert(len(data), Equals, 1)
+	c.Assert(data[0].ReplicaCount, Equals, uint64(2))
+	c.Assert(strings.Join(data[0].LocationLabels, ","), Equals, "a,b")
+	c.Assert(data[0].Available, Equals, false)
+
+	resp, err = http.Post("http://127.0.0.1:10090/tiflash/replica", "application/json", bytes.NewBuffer([]byte(`{"id":84,"region_count":3,"flash_region_count":3}`)))
+	c.Assert(err, IsNil)
+	c.Assert(resp, NotNil)
+	body, err := ioutil.ReadAll(resp.Body)
+	c.Assert(err, IsNil)
+	c.Assert(string(body), Equals, "[schema:1146]Table which ID = 84 does not exist.")
+
+	t, err := ts.domain.InfoSchema().TableByName(model.NewCIStr("tidb"), model.NewCIStr("test"))
+	c.Assert(err, IsNil)
+	req := fmt.Sprintf(`{"id":%d,"region_count":3,"flash_region_count":3}`, t.Meta().ID)
+	resp, err = http.Post("http://127.0.0.1:10090/tiflash/replica", "application/json", bytes.NewBuffer([]byte(req)))
+	c.Assert(err, IsNil)
+	c.Assert(resp, NotNil)
+	body, err = ioutil.ReadAll(resp.Body)
+	c.Assert(err, IsNil)
+	c.Assert(string(body), Equals, "")
+
+	resp, err = http.Get("http://127.0.0.1:10090/tiflash/replica")
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
+	c.Assert(err, IsNil)
+	c.Assert(len(data), Equals, 1)
+	c.Assert(data[0].ReplicaCount, Equals, uint64(2))
+	c.Assert(strings.Join(data[0].LocationLabels, ","), Equals, "a,b")
+	c.Assert(data[0].Available, Equals, true) // The status should be true now.
+
+	// Should not take effect.
+	dbt.mustExec("alter table test set tiflash replica 2 location labels 'a','b';")
+	resp, err = http.Get("http://127.0.0.1:10090/tiflash/replica")
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
+	c.Assert(err, IsNil)
+	c.Assert(len(data), Equals, 1)
+	c.Assert(data[0].ReplicaCount, Equals, uint64(2))
+	c.Assert(strings.Join(data[0].LocationLabels, ","), Equals, "a,b")
+	c.Assert(data[0].Available, Equals, true) // The status should be true now.
 }
 
 func (ts *HTTPHandlerTestSuite) TestDecodeColumnValue(c *C) {
@@ -459,7 +613,6 @@ func (ts *HTTPHandlerTestSuite) TestGetIndexMVCC(c *C) {
 	ts.prepareData(c)
 	defer ts.stopServer(c)
 
-	c.Skip("MVCCLevelDB doesn't implement MVCCDebugger interface.")
 	// tests for normal index key
 	resp, err := http.Get("http://127.0.0.1:10090/mvcc/index/tidb/test/idx1/1?a=1&b=2")
 	c.Assert(err, IsNil)
@@ -500,14 +653,14 @@ func (ts *HTTPHandlerTestSuite) TestGetIndexMVCC(c *C) {
 	resp, err = http.Get("http://127.0.0.1:10090/mvcc/index/tidb/test/idx1/1?a=1")
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
-	var data1 kvrpcpb.MvccGetByKeyResponse
+	var data1 mvccKV
 	err = decoder.Decode(&data1)
 	c.Assert(err, NotNil)
 
 	resp, err = http.Get("http://127.0.0.1:10090/mvcc/index/tidb/test/idx2/1?a=1")
 	c.Assert(err, IsNil)
 	decoder = json.NewDecoder(resp.Body)
-	var data2 kvrpcpb.MvccGetByKeyResponse
+	var data2 mvccKV
 	err = decoder.Decode(&data2)
 	c.Assert(err, NotNil)
 }
@@ -566,7 +719,7 @@ func (ts *HTTPHandlerTestSuite) TestGetSchema(c *C) {
 	decoder = json.NewDecoder(resp.Body)
 	err = decoder.Decode(&lt)
 	c.Assert(err, IsNil)
-	c.Assert(lt[0].Name.L, Equals, "test")
+	c.Assert(len(lt), Greater, 0)
 
 	_, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/schema/abc"))
 	c.Assert(err, IsNil)
@@ -666,15 +819,16 @@ func (ts *HTTPHandlerTestSuite) TestPostSettings(c *C) {
 	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "error")
 	c.Assert(atomic.LoadUint32(&variable.ProcessGeneralLog), Equals, uint32(1))
 	form = make(url.Values)
-	form.Set("log_level", "info")
+	form.Set("log_level", "fatal")
 	form.Set("tidb_general_log", "0")
 	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
 	c.Assert(err, IsNil)
 	c.Assert(resp.StatusCode, Equals, http.StatusOK)
 	c.Assert(atomic.LoadUint32(&variable.ProcessGeneralLog), Equals, uint32(0))
-	c.Assert(log.GetLevel(), Equals, log.InfoLevel)
-	c.Assert(zaplog.GetLevel(), Equals, zap.InfoLevel)
-	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "info")
+	c.Assert(log.GetLevel(), Equals, log.FatalLevel)
+	c.Assert(zaplog.GetLevel(), Equals, zap.FatalLevel)
+	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "fatal")
+	form.Set("log_level", os.Getenv("log_level"))
 
 	// test ddl_slow_threshold
 	form = make(url.Values)
@@ -799,4 +953,25 @@ func (ts *HTTPHandlerTestSuite) TestHotRegionInfo(c *C) {
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
 	c.Assert(resp.StatusCode, Equals, http.StatusBadRequest)
+}
+
+func (ts *HTTPHandlerTestSuite) TestDebugZip(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/debug/zip?seconds=1")
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	out, err := os.Create("/tmp/tidb_debug.zip")
+	c.Assert(err, IsNil)
+	_, err = io.Copy(out, resp.Body)
+	c.Assert(err, IsNil)
+	fileInfo, err := out.Stat()
+	c.Assert(err, IsNil)
+	c.Assert(fileInfo.Size(), Greater, int64(0))
+	err = out.Close()
+	c.Assert(err, IsNil)
+	err = os.Remove("/tmp/tidb_debug.zip")
+	c.Assert(err, IsNil)
+	err = resp.Body.Close()
+	c.Assert(err, IsNil)
 }

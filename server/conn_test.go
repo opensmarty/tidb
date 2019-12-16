@@ -23,6 +23,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
@@ -32,6 +33,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/util/arena"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
@@ -242,7 +244,7 @@ func (ts *ConnTestSuite) TestDispatch(c *C) {
 			out: []byte{
 				0xc, 0x0, 0x0, 0x3, 0x0, 0x1, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x18,
 				0x0, 0x0, 0x4, 0x3, 0x64, 0x65, 0x66, 0x0, 0x0, 0x0, 0x1, 0x31, 0x1, 0x31, 0xc, 0x3f,
-				0x0, 0x1, 0x0, 0x0, 0x0, 0x8, 0x80, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x5, 0xfe,
+				0x0, 0x1, 0x0, 0x0, 0x0, 0x8, 0x81, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x5, 0xfe,
 			},
 		},
 		{
@@ -251,7 +253,7 @@ func (ts *ConnTestSuite) TestDispatch(c *C) {
 			err: nil,
 			out: []byte{
 				0x1, 0x0, 0x0, 0x6, 0x1, 0x18, 0x0, 0x0, 0x7, 0x3, 0x64, 0x65, 0x66, 0x0, 0x0, 0x0,
-				0x1, 0x31, 0x1, 0x31, 0xc, 0x3f, 0x0, 0x1, 0x0, 0x0, 0x0, 0x8, 0x80, 0x0, 0x0, 0x0,
+				0x1, 0x31, 0x1, 0x31, 0xc, 0x3f, 0x0, 0x1, 0x0, 0x0, 0x0, 0x8, 0x81, 0x0, 0x0, 0x0,
 				0x0, 0x1, 0x0, 0x0, 0x8, 0xfe,
 			},
 		},
@@ -450,14 +452,48 @@ func (c *mockTiDBCtx) GetSessionVars() *variable.SessionVars {
 	return &variable.SessionVars{}
 }
 
+type mockRecordSet struct{}
+
+func (m mockRecordSet) Fields() []*ast.ResultField                       { return nil }
+func (m mockRecordSet) Next(ctx context.Context, req *chunk.Chunk) error { return nil }
+func (m mockRecordSet) NewChunk() *chunk.Chunk                           { return nil }
+func (m mockRecordSet) Close() error                                     { return nil }
+
 func (ts *ConnTestSuite) TestShutDown(c *C) {
 	cc := &clientConn{}
 
+	rs := &tidbResultSet{recordSet: mockRecordSet{}}
 	// mock delay response
-	cc.ctx = &mockTiDBCtx{rs: []ResultSet{&tidbResultSet{}}, err: nil}
+	cc.ctx = &mockTiDBCtx{rs: []ResultSet{rs}, err: nil}
 	// set killed flag
 	cc.status = connStatusShutdown
 	// assert ErrQueryInterrupted
 	err := cc.handleQuery(context.Background(), "dummy")
 	c.Assert(err, Equals, executor.ErrQueryInterrupted)
+	c.Assert(rs.closed, Equals, int32(1))
+}
+
+func (ts *ConnTestSuite) TestShutdownOrNotify(c *C) {
+	c.Parallel()
+	se, err := session.CreateSession4Test(ts.store)
+	c.Assert(err, IsNil)
+	tc := &TiDBContext{
+		session: se,
+		stmts:   make(map[int]*TiDBStatement),
+	}
+	cc := &clientConn{
+		connectionID: 1,
+		server: &Server{
+			capability: defaultCapability,
+		},
+		status: connStatusWaitShutdown,
+		ctx:    tc,
+	}
+	c.Assert(cc.ShutdownOrNotify(), IsFalse)
+	cc.status = connStatusReading
+	c.Assert(cc.ShutdownOrNotify(), IsTrue)
+	c.Assert(cc.status, Equals, connStatusShutdown)
+	cc.status = connStatusDispatching
+	c.Assert(cc.ShutdownOrNotify(), IsFalse)
+	c.Assert(cc.status, Equals, connStatusWaitShutdown)
 }

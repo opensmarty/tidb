@@ -14,20 +14,29 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/stringutil"
 	"go.uber.org/zap"
+)
+
+var (
+	null          = []byte("NULL")
+	taskQueueSize = 64 // the maximum number of pending tasks to commit in queue
 )
 
 // LoadDataExec represents a load data executor.
@@ -95,6 +104,12 @@ func (e *LoadDataExec) Open(ctx context.Context) error {
 	return nil
 }
 
+// CommitTask is used for fetching data from data preparing routine into committing routine.
+type CommitTask struct {
+	cnt  uint64
+	rows [][]types.Datum
+}
+
 // LoadDataInfo saves the information of loading data operation.
 type LoadDataInfo struct {
 	*InsertValues
@@ -107,12 +122,160 @@ type LoadDataInfo struct {
 	IgnoreLines uint64
 	Ctx         sessionctx.Context
 	rows        [][]types.Datum
+
+	commitTaskQueue chan CommitTask
+	StopCh          chan struct{}
+	QuitCh          chan struct{}
+}
+
+// GetRows getter for rows
+func (e *LoadDataInfo) GetRows() [][]types.Datum {
+	return e.rows
+}
+
+// GetCurBatchCnt getter for curBatchCnt
+func (e *LoadDataInfo) GetCurBatchCnt() uint64 {
+	return e.curBatchCnt
+}
+
+// CloseTaskQueue preparing routine to inform commit routine no more data
+func (e *LoadDataInfo) CloseTaskQueue() {
+	close(e.commitTaskQueue)
+}
+
+// InitQueues initialize task queue and error report queue
+func (e *LoadDataInfo) InitQueues() {
+	e.commitTaskQueue = make(chan CommitTask, taskQueueSize)
+	e.StopCh = make(chan struct{}, 2)
+	e.QuitCh = make(chan struct{})
+}
+
+// StartStopWatcher monitor StopCh to force quit
+func (e *LoadDataInfo) StartStopWatcher() {
+	go func() {
+		<-e.StopCh
+		close(e.QuitCh)
+	}()
+}
+
+// ForceQuit let commit quit directly
+func (e *LoadDataInfo) ForceQuit() {
+	e.StopCh <- struct{}{}
+}
+
+// MakeCommitTask produce commit task with data in LoadDataInfo.rows LoadDataInfo.curBatchCnt
+func (e *LoadDataInfo) MakeCommitTask() CommitTask {
+	return CommitTask{e.curBatchCnt, e.rows}
+}
+
+// EnqOneTask feed one batch commit task to commit work
+func (e *LoadDataInfo) EnqOneTask(ctx context.Context) error {
+	var err error
+	if e.curBatchCnt > 0 {
+		sendOk := false
+		for !sendOk {
+			select {
+			case e.commitTaskQueue <- e.MakeCommitTask():
+				sendOk = true
+			case <-e.QuitCh:
+				err = errors.New("EnqOneTask forced to quit")
+				logutil.Logger(ctx).Error("EnqOneTask forced to quit, possible commitWork error")
+				return err
+			}
+		}
+		// reset rows buffer, will reallocate buffer but NOT reuse
+		e.SetMaxRowsInBatch(e.maxRowsInBatch)
+	}
+	return err
+}
+
+// CommitOneTask insert Data from LoadDataInfo.rows, then make commit and refresh txn
+func (e *LoadDataInfo) CommitOneTask(ctx context.Context, task CommitTask) error {
+	var err error
+	defer func() {
+		if err != nil {
+			e.Ctx.StmtRollback()
+		}
+	}()
+	err = e.CheckAndInsertOneBatch(ctx, task.rows, task.cnt)
+	if err != nil {
+		logutil.Logger(ctx).Error("commit error CheckAndInsert", zap.Error(err))
+		return err
+	}
+	failpoint.Inject("commitOneTaskErr", func() error {
+		return errors.New("mock commit one task error")
+	})
+	if err = e.Ctx.StmtCommit(); err != nil {
+		logutil.Logger(ctx).Error("commit error commit", zap.Error(err))
+		return err
+	}
+	// Make sure that there are no retries when committing.
+	if err = e.Ctx.RefreshTxnCtx(ctx); err != nil {
+		logutil.Logger(ctx).Error("commit error refresh", zap.Error(err))
+		return err
+	}
+	return err
+}
+
+// CommitWork commit batch sequentially
+func (e *LoadDataInfo) CommitWork(ctx context.Context) error {
+	var err error
+	defer func() {
+		r := recover()
+		if r != nil {
+			logutil.Logger(ctx).Error("CommitWork panicked",
+				zap.Reflect("r", r),
+				zap.Stack("stack"))
+		}
+		if err != nil || r != nil {
+			e.ForceQuit()
+		}
+		if err != nil {
+			e.ctx.StmtRollback()
+		}
+	}()
+	var tasks uint64
+	var end = false
+	for !end {
+		select {
+		case <-e.QuitCh:
+			err = errors.New("commit forced to quit")
+			logutil.Logger(ctx).Error("commit forced to quit, possible preparation failed")
+			break
+		case commitTask, ok := <-e.commitTaskQueue:
+			if ok {
+				start := time.Now()
+				err = e.CommitOneTask(ctx, commitTask)
+				if err != nil {
+					break
+				}
+				tasks++
+				logutil.Logger(ctx).Info("commit one task success",
+					zap.Duration("commit time usage", time.Since(start)),
+					zap.Uint64("keys processed", commitTask.cnt),
+					zap.Uint64("tasks processed", tasks),
+					zap.Int("tasks in queue", len(e.commitTaskQueue)))
+			} else {
+				end = true
+				break
+			}
+		}
+		if err != nil {
+			logutil.Logger(ctx).Error("load data commit work error", zap.Error(err))
+			break
+		}
+	}
+	return err
 }
 
 // SetMaxRowsInBatch sets the max number of rows to insert in a batch.
 func (e *LoadDataInfo) SetMaxRowsInBatch(limit uint64) {
 	e.maxRowsInBatch = limit
 	e.rows = make([][]types.Datum, 0, limit)
+	for i := 0; uint64(i) < limit; i++ {
+		e.rows = append(e.rows, make([]types.Datum, len(e.Table.Cols())))
+	}
+	e.curBatchCnt = 0
 }
 
 // getValidData returns prevData and curData that starts from starting symbol.
@@ -127,7 +290,7 @@ func (e *LoadDataInfo) getValidData(prevData, curData []byte) ([]byte, []byte) {
 	prevLen := len(prevData)
 	if prevLen > 0 {
 		// starting symbol in the prevData
-		idx := strings.Index(string(prevData), e.LinesInfo.Starting)
+		idx := strings.Index(string(hack.String(prevData)), e.LinesInfo.Starting)
 		if idx != -1 {
 			return prevData[idx:], curData
 		}
@@ -138,14 +301,14 @@ func (e *LoadDataInfo) getValidData(prevData, curData []byte) ([]byte, []byte) {
 			restStart = curData[:startingLen-1]
 		}
 		prevData = append(prevData, restStart...)
-		idx = strings.Index(string(prevData), e.LinesInfo.Starting)
+		idx = strings.Index(string(hack.String(prevData)), e.LinesInfo.Starting)
 		if idx != -1 {
 			return prevData[idx:prevLen], curData
 		}
 	}
 
 	// starting symbol in the curData
-	idx := strings.Index(string(curData), e.LinesInfo.Starting)
+	idx := strings.Index(string(hack.String(curData)), e.LinesInfo.Starting)
 	if idx != -1 {
 		return nil, curData[idx:]
 	}
@@ -174,7 +337,7 @@ func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) 
 	}
 	endIdx := -1
 	if len(curData) >= curStartIdx {
-		endIdx = strings.Index(string(curData[curStartIdx:]), e.LinesInfo.Terminated)
+		endIdx = strings.Index(string(hack.String(curData[curStartIdx:])), e.LinesInfo.Terminated)
 	}
 	if endIdx == -1 {
 		// no terminated symbol
@@ -184,7 +347,7 @@ func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) 
 
 		// terminated symbol in the middle of prevData and curData
 		curData = append(prevData, curData...)
-		endIdx = strings.Index(string(curData[startingLen:]), e.LinesInfo.Terminated)
+		endIdx = strings.Index(string(hack.String(curData[startingLen:])), e.LinesInfo.Terminated)
 		if endIdx != -1 {
 			nextDataIdx := startingLen + endIdx + terminatedLen
 			return curData[startingLen : startingLen+endIdx], curData[nextDataIdx:], true
@@ -201,7 +364,7 @@ func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) 
 
 	// terminated symbol in the curData
 	prevData = append(prevData, curData[:nextDataIdx]...)
-	endIdx = strings.Index(string(prevData[startingLen:]), e.LinesInfo.Terminated)
+	endIdx = strings.Index(string(hack.String(prevData[startingLen:])), e.LinesInfo.Terminated)
 	if endIdx >= prevLen {
 		return prevData[startingLen : startingLen+endIdx], curData[nextDataIdx:], true
 	}
@@ -253,11 +416,14 @@ func (e *LoadDataInfo) InsertData(ctx context.Context, prevData, curData []byte)
 		if err != nil {
 			return nil, false, err
 		}
-		e.rows = append(e.rows, e.colsToRow(ctx, cols))
+		// rowCount will be used in fillRow(), last insert ID will be assigned according to the rowCount = 1.
+		// So should add first here.
 		e.rowCount++
+		e.colsToRow(ctx, cols)
+		e.curBatchCnt++
 		if e.maxRowsInBatch != 0 && e.rowCount%e.maxRowsInBatch == 0 {
 			reachLimit = true
-			logutil.BgLogger().Info("batch limit hit when inserting rows", zap.Int("maxBatchRows", e.maxChunkSize),
+			logutil.Logger(ctx).Info("batch limit hit when inserting rows", zap.Int("maxBatchRows", e.maxChunkSize),
 				zap.Uint64("totalRows", e.rowCount))
 			break
 		}
@@ -266,17 +432,16 @@ func (e *LoadDataInfo) InsertData(ctx context.Context, prevData, curData []byte)
 }
 
 // CheckAndInsertOneBatch is used to commit one transaction batch full filled data
-func (e *LoadDataInfo) CheckAndInsertOneBatch() error {
+func (e *LoadDataInfo) CheckAndInsertOneBatch(ctx context.Context, rows [][]types.Datum, cnt uint64) error {
 	var err error
-	if len(e.rows) == 0 {
+	if cnt == 0 {
 		return err
 	}
-	e.ctx.GetSessionVars().StmtCtx.AddRecordRows(uint64(len(e.rows)))
-	err = e.batchCheckAndInsert(e.rows, e.addRecordLD)
+	e.ctx.GetSessionVars().StmtCtx.AddRecordRows(cnt)
+	err = e.batchCheckAndInsert(ctx, rows[0:cnt], e.addRecordLD)
 	if err != nil {
 		return err
 	}
-	e.rows = e.rows[:0]
 	return err
 }
 
@@ -312,7 +477,7 @@ func (e *LoadDataInfo) colsToRow(ctx context.Context, cols []field) []types.Datu
 			e.row[i].SetString(string(cols[i].str))
 		}
 	}
-	row, err := e.getRow(ctx, e.row)
+	row, err := e.getRowInPlace(ctx, e.row, e.rows[e.curBatchCnt])
 	if err != nil {
 		e.handleWarning(err)
 		return nil
@@ -320,13 +485,14 @@ func (e *LoadDataInfo) colsToRow(ctx context.Context, cols []field) []types.Datu
 	return row
 }
 
-func (e *LoadDataInfo) addRecordLD(row []types.Datum) (int64, error) {
+func (e *LoadDataInfo) addRecordLD(ctx context.Context, row []types.Datum) (int64, error) {
 	if row == nil {
 		return 0, nil
 	}
-	h, err := e.addRecord(row)
+	h, err := e.addRecord(ctx, row)
 	if err != nil {
 		e.handleWarning(err)
+		return 0, err
 	}
 	return h, nil
 }
@@ -339,17 +505,17 @@ type field struct {
 
 type fieldWriter struct {
 	pos           int
+	ReadBuf       []byte
+	OutputBuf     []byte
 	enclosedChar  byte
 	fieldTermChar byte
-	term          *string
+	term          string
 	isEnclosed    bool
 	isLineStart   bool
 	isFieldStart  bool
-	ReadBuf       *[]byte
-	OutputBuf     []byte
 }
 
-func (w *fieldWriter) Init(enclosedChar byte, fieldTermChar byte, readBuf *[]byte, term *string) {
+func (w *fieldWriter) Init(enclosedChar byte, fieldTermChar byte, readBuf []byte, term string) {
 	w.isEnclosed = false
 	w.isLineStart = true
 	w.isFieldStart = true
@@ -364,8 +530,8 @@ func (w *fieldWriter) putback() {
 }
 
 func (w *fieldWriter) getChar() (bool, byte) {
-	if w.pos < len(*w.ReadBuf) {
-		ret := (*w.ReadBuf)[w.pos]
+	if w.pos < len(w.ReadBuf) {
+		ret := w.ReadBuf[w.pos]
 		w.pos++
 		return true, ret
 	}
@@ -374,9 +540,9 @@ func (w *fieldWriter) getChar() (bool, byte) {
 
 func (w *fieldWriter) isTerminator() bool {
 	chkpt, isterm := w.pos, true
-	for i := 1; i < len(*w.term); i++ {
+	for i := 1; i < len(w.term); i++ {
 		flag, ch := w.getChar()
-		if !flag || ch != (*w.term)[i] {
+		if !flag || ch != w.term[i] {
 			isterm = false
 			break
 		}
@@ -490,11 +656,11 @@ func (e *LoadDataInfo) getFieldsFromLine(line []byte) ([]field, error) {
 		return fields, nil
 	}
 
-	reader.Init(e.FieldsInfo.Enclosed, e.FieldsInfo.Terminated[0], &line, &e.FieldsInfo.Terminated)
+	reader.Init(e.FieldsInfo.Enclosed, e.FieldsInfo.Terminated[0], line, e.FieldsInfo.Terminated)
 	for {
 		eol, f := reader.GetField()
 		f = f.escape()
-		if string(f.str) == "NULL" && !f.enclosed {
+		if bytes.Equal(f.str, null) && !f.enclosed {
 			f.str = []byte{'N'}
 			f.maybeNull = true
 		}

@@ -33,12 +33,7 @@ import (
 
 // Error instances.
 var (
-	ErrUnsupportedType = terror.ClassOptimizer.New(CodeUnsupportedType, "Unsupported type")
-)
-
-// Error codes.
-const (
-	CodeUnsupportedType terror.ErrCode = 1
+	ErrUnsupportedType = terror.ClassOptimizer.New(mysql.ErrUnsupportedType, mysql.MySQLErrName[mysql.ErrUnsupportedType])
 )
 
 // RangeType is alias for int.
@@ -656,21 +651,23 @@ func (r *builder) merge(a, b []point, union bool) []point {
 	} else {
 		requiredInRangeCount = 2
 	}
-	merged := make([]point, 0, len(mergedPoints))
+	curTail := 0
 	for _, val := range mergedPoints {
 		if val.start {
 			inRangeCount++
 			if inRangeCount == requiredInRangeCount {
-				// just reached the required in range count, a new range started.
-				merged = append(merged, val)
+				// Just reached the required in range count, a new range started.
+				mergedPoints[curTail] = val
+				curTail++
 			}
 		} else {
 			if inRangeCount == requiredInRangeCount {
-				// just about to leave the required in range count, the range is ended.
-				merged = append(merged, val)
+				// Just about to leave the required in range count, the range is ended.
+				mergedPoints[curTail] = val
+				curTail++
 			}
 			inRangeCount--
 		}
 	}
-	return merged
+	return mergedPoints[:curTail]
 }

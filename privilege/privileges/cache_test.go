@@ -28,7 +28,6 @@ var _ = Suite(&testCacheSuite{})
 
 type testCacheSuite struct {
 	store  kv.Storage
-	dbName string
 	domain *domain.Domain
 }
 
@@ -68,6 +67,8 @@ func (s *testCacheSuite) TestLoadUserTable(c *C) {
 	p = privileges.MySQLPrivilege{}
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
+	c.Assert(p.User, HasLen, len(p.UserMap))
+
 	user := p.User
 	c.Assert(user[0].User, Equals, "root")
 	c.Assert(user[0].Privileges, Equals, mysql.SelectPriv)
@@ -89,6 +90,8 @@ func (s *testCacheSuite) TestLoadDBTable(c *C) {
 	var p privileges.MySQLPrivilege
 	err = p.LoadDBTable(se)
 	c.Assert(err, IsNil)
+	c.Assert(p.DB, HasLen, len(p.DBMap))
+
 	c.Assert(p.DB[0].Privileges, Equals, mysql.SelectPriv|mysql.InsertPriv|mysql.UpdatePriv|mysql.DeletePriv|mysql.CreatePriv)
 	c.Assert(p.DB[1].Privileges, Equals, mysql.DropPriv|mysql.GrantPriv|mysql.IndexPriv|mysql.AlterPriv|mysql.CreateViewPriv|mysql.ShowViewPriv|mysql.ExecutePriv)
 }
@@ -105,6 +108,8 @@ func (s *testCacheSuite) TestLoadTablesPrivTable(c *C) {
 	var p privileges.MySQLPrivilege
 	err = p.LoadTablesPrivTable(se)
 	c.Assert(err, IsNil)
+	c.Assert(p.TablesPriv, HasLen, len(p.TablesPrivMap))
+
 	c.Assert(p.TablesPriv[0].Host, Equals, `%`)
 	c.Assert(p.TablesPriv[0].DB, Equals, "db")
 	c.Assert(p.TablesPriv[0].User, Equals, "user")
@@ -161,7 +166,7 @@ func (s *testCacheSuite) TestPatternMatch(c *C) {
 	defer se.Close()
 	mustExec(c, se, "USE MYSQL;")
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")
-	mustExec(c, se, `INSERT INTO mysql.user VALUES ("10.0.%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")`)
+	mustExec(c, se, `INSERT INTO mysql.user VALUES ("10.0.%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N", "Y")`)
 	var p privileges.MySQLPrivilege
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
@@ -171,14 +176,16 @@ func (s *testCacheSuite) TestPatternMatch(c *C) {
 	c.Assert(p.RequestVerification(activeRoles, "root", "127.0.0.1", "test", "", "", mysql.SelectPriv), IsFalse)
 	c.Assert(p.RequestVerification(activeRoles, "root", "114.114.114.114", "test", "", "", mysql.SelectPriv), IsFalse)
 	c.Assert(p.RequestVerification(activeRoles, "root", "114.114.114.114", "test", "", "", mysql.PrivilegeType(0)), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "root", "10.0.1.118", "test", "", "", mysql.ShutdownPriv), IsTrue)
 
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")
-	mustExec(c, se, `INSERT INTO mysql.user VALUES ("", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")`)
+	mustExec(c, se, `INSERT INTO mysql.user VALUES ("", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N", "N")`)
 	p = privileges.MySQLPrivilege{}
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
 	c.Assert(p.RequestVerification(activeRoles, "root", "", "test", "", "", mysql.SelectPriv), IsTrue)
 	c.Assert(p.RequestVerification(activeRoles, "root", "notnull", "test", "", "", mysql.SelectPriv), IsFalse)
+	c.Assert(p.RequestVerification(activeRoles, "root", "", "test", "", "", mysql.ShutdownPriv), IsFalse)
 
 	// Pattern match for DB.
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")

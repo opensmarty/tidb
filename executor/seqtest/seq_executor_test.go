@@ -36,6 +36,7 @@ import (
 	pb "github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
@@ -109,9 +110,10 @@ func (s *seqTestSuite) TestEarlyClose(c *C) {
 	tk.MustExec("use test")
 	tk.MustExec("create table earlyclose (id int primary key)")
 
-	// Insert 1000 rows.
+	N := 100
+	// Insert N rows.
 	var values []string
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < N; i++ {
 		values = append(values, fmt.Sprintf("(%d)", i))
 	}
 	tk.MustExec("insert earlyclose values " + strings.Join(values, ","))
@@ -124,10 +126,10 @@ func (s *seqTestSuite) TestEarlyClose(c *C) {
 	tblID := tbl.Meta().ID
 
 	// Split the table.
-	s.cluster.SplitTable(s.mvccStore, tblID, 500)
+	s.cluster.SplitTable(s.mvccStore, tblID, N/2)
 
 	ctx := context.Background()
-	for i := 0; i < 500; i++ {
+	for i := 0; i < N/2; i++ {
 		rss, err1 := tk.Se.Execute(ctx, "select * from earlyclose order by id")
 		c.Assert(err1, IsNil)
 		rs := rss[0]
@@ -587,7 +589,7 @@ func (s *seqTestSuite) TestShow(c *C) {
 		"c4|varchar(6)|YES||1|",
 		"c5|varchar(6)|YES||'C6'|",
 		"c6|enum('s','m','l','xl')|YES||xl|",
-		"c7|set('a','b','c','d')|YES||a,c,c|",
+		"c7|set('a','b','c','d')|YES||a,c|",
 		"c8|datetime|YES||CURRENT_TIMESTAMP|DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
 		"c9|year(4)|YES||2014|",
 	))
@@ -662,7 +664,7 @@ func (s *seqTestSuite) TestParallelHashAggClose(c *C) {
 	// HashAgg_8              | 2.40  | root | group by:t.b, funcs:sum(t.a)
 	// └─Projection_9         | 3.00  | root | cast(test.t.a), test.t.b
 	//   └─TableReader_11     | 3.00  | root | data:TableScan_10
-	//     └─TableScan_10     | 3.00  | cop  | table:t, range:[-inf,+inf], keep order:fa$se, stats:pseudo |
+	//     └─TableScan_10     | 3.00  | cop[tikv]  | table:t, range:[-inf,+inf], keep order:fa$se, stats:pseudo |
 
 	// Goroutine should not leak when error happen.
 	c.Assert(failpoint.Enable("github.com/pingcap/tidb/executor/parallelHashAggError", `return(true)`), IsNil)
@@ -753,6 +755,43 @@ func (s *seqTestSuite) TestAdminShowNextID(c *C) {
 	r.Check(testkit.Rows("test1 tt id 41"))
 }
 
+func (s *seqTestSuite) TestNoHistoryWhenDisableRetry(c *C) {
+	tk := testkit.NewTestKitWithInit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists history")
+	tk.MustExec("create table history (a int)")
+	tk.MustExec("set @@autocommit = 0")
+
+	// retry_limit = 0 will not add history.
+	tk.MustExec("set @@tidb_retry_limit = 0")
+	tk.MustExec("insert history values (1)")
+	c.Assert(session.GetHistory(tk.Se).Count(), Equals, 0)
+
+	// Disable auto_retry will add history for auto committed only
+	tk.MustExec("set @@autocommit = 1")
+	tk.MustExec("set @@tidb_retry_limit = 10")
+	tk.MustExec("set @@tidb_disable_txn_auto_retry = 1")
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/session/keepHistory", `return(true)`), IsNil)
+	tk.MustExec("insert history values (1)")
+	c.Assert(session.GetHistory(tk.Se).Count(), Equals, 1)
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/session/keepHistory"), IsNil)
+	tk.MustExec("begin")
+	tk.MustExec("insert history values (1)")
+	c.Assert(session.GetHistory(tk.Se).Count(), Equals, 0)
+	tk.MustExec("commit")
+
+	// Enable auto_retry will add history for both.
+	tk.MustExec("set @@tidb_disable_txn_auto_retry = 0")
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/session/keepHistory", `return(true)`), IsNil)
+	tk.MustExec("insert history values (1)")
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/session/keepHistory"), IsNil)
+	c.Assert(session.GetHistory(tk.Se).Count(), Equals, 1)
+	tk.MustExec("begin")
+	tk.MustExec("insert history values (1)")
+	c.Assert(session.GetHistory(tk.Se).Count(), Equals, 2)
+	tk.MustExec("commit")
+}
+
 func (s *seqTestSuite) TestPrepareMaxParamCountCheck(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -794,12 +833,12 @@ func (s *seqTestSuite) TestCartesianProduct(c *C) {
 }
 
 func (s *seqTestSuite) TestBatchInsertDelete(c *C) {
-	originLimit := atomic.LoadUint64(&kv.TxnEntryCountLimit)
+	originLimit := atomic.LoadUint64(&kv.TxnTotalSizeLimit)
 	defer func() {
-		atomic.StoreUint64(&kv.TxnEntryCountLimit, originLimit)
+		atomic.StoreUint64(&kv.TxnTotalSizeLimit, originLimit)
 	}()
 	// Set the limitation to a small value, make it easier to reach the limitation.
-	atomic.StoreUint64(&kv.TxnEntryCountLimit, 100)
+	atomic.StoreUint64(&kv.TxnTotalSizeLimit, 5000)
 
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -827,19 +866,29 @@ func (s *seqTestSuite) TestBatchInsertDelete(c *C) {
 	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
 	r = tk.MustQuery("select count(*) from batch_insert;")
 	r.Check(testkit.Rows("160"))
+	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("320"))
 	// for on duplicate key
-	for i := 0; i < 160; i++ {
+	for i := 0; i < 320; i++ {
 		tk.MustExec(fmt.Sprintf("insert into batch_insert_on_duplicate values(%d, %d);", i, i))
 	}
 	r = tk.MustQuery("select count(*) from batch_insert_on_duplicate;")
-	r.Check(testkit.Rows("160"))
+	r.Check(testkit.Rows("320"))
 
 	// This will meet txn too large error.
 	_, err := tk.Exec("insert into batch_insert (c) select * from batch_insert;")
 	c.Assert(err, NotNil)
 	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
 	r = tk.MustQuery("select count(*) from batch_insert;")
-	r.Check(testkit.Rows("160"))
+	r.Check(testkit.Rows("320"))
+
+	// Test tidb_batch_insert could not work if enable-batch-dml is disabled.
+	tk.MustExec("set @@session.tidb_batch_insert=1;")
+	_, err = tk.Exec("insert into batch_insert (c) select * from batch_insert;")
+	c.Assert(err, NotNil)
+	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
+	tk.MustExec("set @@session.tidb_batch_insert=0;")
 
 	// for on duplicate key
 	_, err = tk.Exec(`insert into batch_insert_on_duplicate select * from batch_insert_on_duplicate as tt
@@ -847,23 +896,31 @@ func (s *seqTestSuite) TestBatchInsertDelete(c *C) {
 	c.Assert(err, NotNil)
 	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue, Commentf("%v", err))
 	r = tk.MustQuery("select count(*) from batch_insert;")
-	r.Check(testkit.Rows("160"))
+	r.Check(testkit.Rows("320"))
+
+	cfg := config.GetGlobalConfig()
+	newCfg := *cfg
+	newCfg.EnableBatchDML = true
+	config.StoreGlobalConfig(&newCfg)
+	defer func() {
+		config.StoreGlobalConfig(cfg)
+	}()
 
 	// Change to batch inset mode and batch size to 50.
 	tk.MustExec("set @@session.tidb_batch_insert=1;")
 	tk.MustExec("set @@session.tidb_dml_batch_size=50;")
 	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
 	r = tk.MustQuery("select count(*) from batch_insert;")
-	r.Check(testkit.Rows("320"))
+	r.Check(testkit.Rows("640"))
 
 	// Enlarge the batch size to 150 which is larger than the txn limitation (100).
 	// So the insert will meet error.
-	tk.MustExec("set @@session.tidb_dml_batch_size=150;")
+	tk.MustExec("set @@session.tidb_dml_batch_size=600;")
 	_, err = tk.Exec("insert into batch_insert (c) select * from batch_insert;")
 	c.Assert(err, NotNil)
 	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
 	r = tk.MustQuery("select count(*) from batch_insert;")
-	r.Check(testkit.Rows("320"))
+	r.Check(testkit.Rows("640"))
 	// Set it back to 50.
 	tk.MustExec("set @@session.tidb_dml_batch_size=50;")
 
@@ -872,7 +929,7 @@ func (s *seqTestSuite) TestBatchInsertDelete(c *C) {
 		on duplicate key update batch_insert_on_duplicate.id=batch_insert_on_duplicate.id+1000;`)
 	c.Assert(err, IsNil)
 	r = tk.MustQuery("select count(*) from batch_insert_on_duplicate;")
-	r.Check(testkit.Rows("160"))
+	r.Check(testkit.Rows("320"))
 
 	// Disable BachInsert mode in transition.
 	tk.MustExec("begin;")
@@ -881,7 +938,7 @@ func (s *seqTestSuite) TestBatchInsertDelete(c *C) {
 	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
 	tk.MustExec("rollback;")
 	r = tk.MustQuery("select count(*) from batch_insert;")
-	r.Check(testkit.Rows("320"))
+	r.Check(testkit.Rows("640"))
 
 	tk.MustExec("drop table if exists com_batch_insert")
 	tk.MustExec("create table com_batch_insert (c int)")
@@ -900,7 +957,7 @@ func (s *seqTestSuite) TestBatchInsertDelete(c *C) {
 	c.Assert(err, NotNil)
 	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
 	r = tk.MustQuery("select count(*) from batch_insert;")
-	r.Check(testkit.Rows("320"))
+	r.Check(testkit.Rows("640"))
 	// Enable batch delete and set batch size to 50.
 	tk.MustExec("set @@session.tidb_batch_delete=on;")
 	tk.MustExec("set @@session.tidb_dml_batch_size=50;")
@@ -1027,7 +1084,78 @@ func (s *seqTestSuite1) TestCoprocessorPriority(c *C) {
 	cli.setCheckPriority(pb.CommandPri_Low)
 	tk.MustQuery("select LOW_PRIORITY id from t where id = 1")
 
+	cli.setCheckPriority(pb.CommandPri_High)
+	tk.MustExec("set tidb_force_priority = 'HIGH_PRIORITY'")
+	tk.MustQuery("select * from t").Check(testkit.Rows("3"))
+	tk.MustExec("update t set id = id + 1")
+	tk.MustQuery("select v from t1 where id = 0 or id = 1").Check(testkit.Rows("0", "1"))
+
+	cli.setCheckPriority(pb.CommandPri_Low)
+	tk.MustExec("set tidb_force_priority = 'LOW_PRIORITY'")
+	tk.MustQuery("select * from t").Check(testkit.Rows("4"))
+	tk.MustExec("update t set id = id + 1")
+	tk.MustQuery("select v from t1 where id = 0 or id = 1").Check(testkit.Rows("0", "1"))
+
+	cli.setCheckPriority(pb.CommandPri_Normal)
+	tk.MustExec("set tidb_force_priority = 'DELAYED'")
+	tk.MustQuery("select * from t").Check(testkit.Rows("5"))
+	tk.MustExec("update t set id = id + 1")
+	tk.MustQuery("select v from t1 where id = 0 or id = 1").Check(testkit.Rows("0", "1"))
+
+	cli.setCheckPriority(pb.CommandPri_Low)
+	tk.MustExec("set tidb_force_priority = 'NO_PRIORITY'")
+	tk.MustQuery("select * from t").Check(testkit.Rows("6"))
+	tk.MustExec("update t set id = id + 1")
+	tk.MustQuery("select v from t1 where id = 0 or id = 1").Check(testkit.Rows("0", "1"))
+
 	cli.mu.Lock()
 	cli.mu.checkPrio = false
 	cli.mu.Unlock()
+}
+
+func (s *seqTestSuite) TestAutoIDInRetry(c *C) {
+	tk := testkit.NewTestKitWithInit(c, s.store)
+	tk.MustExec("drop table if exists t;")
+	tk.MustExec("create table t (id int not null auto_increment primary key)")
+
+	tk.MustExec("set @@tidb_disable_txn_auto_retry = 0")
+	tk.MustExec("begin")
+	tk.MustExec("insert into t values ()")
+	tk.MustExec("insert into t values (),()")
+	tk.MustExec("insert into t values ()")
+
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/session/mockCommitRetryForAutoID", `return(true)`), IsNil)
+	tk.MustExec("commit")
+	c.Assert(failpoint.Disable("github.com/pingcap/tidb/session/mockCommitRetryForAutoID"), IsNil)
+
+	tk.MustExec("insert into t values ()")
+	tk.MustQuery(`select * from t`).Check(testkit.Rows("1", "2", "3", "4", "5"))
+}
+
+func (s *seqTestSuite) TestMaxDeltaSchemaCount(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	c.Assert(variable.GetMaxDeltaSchemaCount(), Equals, int64(variable.DefTiDBMaxDeltaSchemaCount))
+	gvc := domain.GetDomain(tk.Se).GetGlobalVarsCache()
+	gvc.Disable()
+
+	tk.MustExec("set @@global.tidb_max_delta_schema_count= -1")
+	tk.MustQuery("show warnings;").Check(testkit.Rows("Warning 1292 Truncated incorrect tidb_max_delta_schema_count value: '-1'"))
+	// Make sure a new session will load global variables.
+	tk.Se = nil
+	tk.MustExec("use test")
+	c.Assert(variable.GetMaxDeltaSchemaCount(), Equals, int64(100))
+	tk.MustExec(fmt.Sprintf("set @@global.tidb_max_delta_schema_count= %v", uint64(math.MaxInt64)))
+	tk.MustQuery("show warnings;").Check(testkit.Rows(fmt.Sprintf("Warning 1292 Truncated incorrect tidb_max_delta_schema_count value: '%d'", uint64(math.MaxInt64))))
+	tk.Se = nil
+	tk.MustExec("use test")
+	c.Assert(variable.GetMaxDeltaSchemaCount(), Equals, int64(16384))
+	_, err := tk.Exec("set @@global.tidb_max_delta_schema_count= invalid_val")
+	c.Assert(terror.ErrorEqual(err, variable.ErrWrongTypeForVar), IsTrue, Commentf("err %v", err))
+
+	tk.MustExec("set @@global.tidb_max_delta_schema_count= 2048")
+	tk.Se = nil
+	tk.MustExec("use test")
+	c.Assert(variable.GetMaxDeltaSchemaCount(), Equals, int64(2048))
+	tk.MustQuery("select @@global.tidb_max_delta_schema_count").Check(testkit.Rows("2048"))
 }

@@ -16,7 +16,6 @@ package mocktikv
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"sort"
 	"time"
 
@@ -75,6 +74,7 @@ type tableScanExec struct {
 	kvRanges       []kv.KeyRange
 	startTS        uint64
 	isolationLevel kvrpcpb.IsolationLevel
+	resolvedLocks  []uint64
 	mvccStore      MVCCStore
 	cursor         int
 	seekKey        []byte
@@ -180,7 +180,7 @@ func (e *tableScanExec) Next(ctx context.Context) (value [][]byte, err error) {
 }
 
 func (e *tableScanExec) getRowFromPoint(ran kv.KeyRange) ([][]byte, error) {
-	val, err := e.mvccStore.Get(ran.StartKey, e.startTS, e.isolationLevel)
+	val, err := e.mvccStore.Get(ran.StartKey, e.startTS, e.isolationLevel, e.resolvedLocks)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -209,9 +209,9 @@ func (e *tableScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 	var pairs []Pair
 	var pair Pair
 	if e.Desc {
-		pairs = e.mvccStore.ReverseScan(ran.StartKey, e.seekKey, 1, e.startTS, e.isolationLevel)
+		pairs = e.mvccStore.ReverseScan(ran.StartKey, e.seekKey, 1, e.startTS, e.isolationLevel, e.resolvedLocks)
 	} else {
-		pairs = e.mvccStore.Scan(e.seekKey, ran.EndKey, 1, e.startTS, e.isolationLevel)
+		pairs = e.mvccStore.Scan(e.seekKey, ran.EndKey, 1, e.startTS, e.isolationLevel, e.resolvedLocks)
 	}
 	if len(pairs) > 0 {
 		pair = pairs[0]
@@ -246,22 +246,17 @@ func (e *tableScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 	return row, nil
 }
 
-const (
-	pkColNotExists = iota
-	pkColIsSigned
-	pkColIsUnsigned
-)
-
 type indexScanExec struct {
 	*tipb.IndexScan
 	colsLen        int
 	kvRanges       []kv.KeyRange
 	startTS        uint64
 	isolationLevel kvrpcpb.IsolationLevel
+	resolvedLocks  []uint64
 	mvccStore      MVCCStore
 	cursor         int
 	seekKey        []byte
-	pkStatus       int
+	pkStatus       tablecodec.PrimaryKeyStatus
 	start          int
 	counts         []int64
 	execDetail     *execDetail
@@ -366,44 +361,14 @@ func (e *indexScanExec) Next(ctx context.Context) (value [][]byte, err error) {
 
 // getRowFromPoint is only used for unique key.
 func (e *indexScanExec) getRowFromPoint(ran kv.KeyRange) ([][]byte, error) {
-	val, err := e.mvccStore.Get(ran.StartKey, e.startTS, e.isolationLevel)
+	val, err := e.mvccStore.Get(ran.StartKey, e.startTS, e.isolationLevel, e.resolvedLocks)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	if len(val) == 0 {
 		return nil, nil
 	}
-	return e.decodeIndexKV(Pair{Key: ran.StartKey, Value: val})
-}
-
-func (e *indexScanExec) decodeIndexKV(pair Pair) ([][]byte, error) {
-	values, b, err := tablecodec.CutIndexKeyNew(pair.Key, e.colsLen)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	if len(b) > 0 {
-		if e.pkStatus != pkColNotExists {
-			values = append(values, b)
-		}
-	} else if e.pkStatus != pkColNotExists {
-		handle, err := decodeHandle(pair.Value)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		var handleDatum types.Datum
-		if e.pkStatus == pkColIsUnsigned {
-			handleDatum = types.NewUintDatum(uint64(handle))
-		} else {
-			handleDatum = types.NewIntDatum(handle)
-		}
-		handleBytes, err := codec.EncodeValue(nil, b, handleDatum)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		values = append(values, handleBytes)
-	}
-
-	return values, nil
+	return tablecodec.DecodeIndexKV(ran.StartKey, val, e.colsLen, e.pkStatus)
 }
 
 func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
@@ -417,9 +382,9 @@ func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 	var pairs []Pair
 	var pair Pair
 	if e.Desc {
-		pairs = e.mvccStore.ReverseScan(ran.StartKey, e.seekKey, 1, e.startTS, e.isolationLevel)
+		pairs = e.mvccStore.ReverseScan(ran.StartKey, e.seekKey, 1, e.startTS, e.isolationLevel, e.resolvedLocks)
 	} else {
-		pairs = e.mvccStore.Scan(e.seekKey, ran.EndKey, 1, e.startTS, e.isolationLevel)
+		pairs = e.mvccStore.Scan(e.seekKey, ran.EndKey, 1, e.startTS, e.isolationLevel, e.resolvedLocks)
 	}
 	if len(pairs) > 0 {
 		pair = pairs[0]
@@ -443,7 +408,7 @@ func (e *indexScanExec) getRowFromRange(ran kv.KeyRange) ([][]byte, error) {
 		e.seekKey = []byte(kv.Key(pair.Key).PrefixNext())
 	}
 
-	return e.decodeIndexKV(pair)
+	return tablecodec.DecodeIndexKV(pair.Key, pair.Value, e.colsLen, e.pkStatus)
 }
 
 type selectionExec struct {
@@ -756,11 +721,4 @@ func convertToExprs(sc *stmtctx.StatementContext, fieldTps []*types.FieldType, p
 		exprs = append(exprs, e)
 	}
 	return exprs, nil
-}
-
-func decodeHandle(data []byte) (int64, error) {
-	var h int64
-	buf := bytes.NewBuffer(data)
-	err := binary.Read(buf, binary.BigEndian, &h)
-	return h, errors.Trace(err)
 }

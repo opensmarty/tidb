@@ -37,6 +37,7 @@ var (
 	_ builtinFunc = &builtinCaseWhenStringSig{}
 	_ builtinFunc = &builtinCaseWhenTimeSig{}
 	_ builtinFunc = &builtinCaseWhenDurationSig{}
+	_ builtinFunc = &builtinCaseWhenJSONSig{}
 	_ builtinFunc = &builtinIfNullIntSig{}
 	_ builtinFunc = &builtinIfNullRealSig{}
 	_ builtinFunc = &builtinIfNullDecimalSig{}
@@ -67,9 +68,8 @@ func InferType4ControlFuncs(lhs, rhs *types.FieldType) *types.FieldType {
 	} else if rhs.Tp == mysql.TypeNull {
 		*resultFieldType = *lhs
 	} else {
-		var unsignedFlag uint
-		evalType := types.AggregateEvalType([]*types.FieldType{lhs, rhs}, &unsignedFlag)
 		resultFieldType = types.AggFieldType([]*types.FieldType{lhs, rhs})
+		evalType := types.AggregateEvalType([]*types.FieldType{lhs, rhs}, &resultFieldType.Flag)
 		if evalType == types.ETInt {
 			resultFieldType.Decimal = 0
 		} else {
